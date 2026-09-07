@@ -10,7 +10,7 @@ def precompute_and_store_context_kv(
     self,
     context_states: torch.Tensor,
     context_positions: torch.Tensor,
-    context_slot_mapping: torch.Tensor | None = None,
+    context_slot_mapping: torch.Tensor | list[torch.Tensor | None] | None = None,
 ) -> None:
     if not hasattr(self, "_num_attn_layers"):
         self._build_fused_kv_buffers()
@@ -39,11 +39,15 @@ def precompute_and_store_context_kv(
 
     # --- Fused RoPE across all layers ---
     # View as [L * num_ctx, kv] so RoPE sees one big batch (no copy).
-    # In-place RoPE: pass K as the "query" arg with key=None.
+    # Ascend's RotaryEmbedding uses a functional implementation, unlike the
+    # CUDA custom op used by upstream. Keep its returned query tensor; dropping
+    # it leaves context K unrotated and causes DFlash acceptance to collapse as
+    # the context grows.
     all_k_flat = all_k_normed.view(L * num_ctx, kv)
     positions_repeated = context_positions.repeat(L)
-    tmpv = all_k_flat.clone()
-    self.layers[0].self_attn.rotary_emb(positions_repeated, all_k_flat, tmpv)
+    all_k_flat, _ = self.layers[0].self_attn.rotary_emb(
+        positions_repeated, all_k_flat, None
+    )
 
     if context_slot_mapping is None:
         return
@@ -51,6 +55,11 @@ def precompute_and_store_context_kv(
     # --- Per-layer cache insert ---
     all_k_final = all_k_flat.view(L, num_ctx, nkv, hd)
     per_layer = isinstance(context_slot_mapping, (list, tuple))
+    if per_layer and len(context_slot_mapping) != L:
+        raise ValueError(
+            "DFlash context slot mappings must contain one entry for each "
+            f"draft layer; got {len(context_slot_mapping)} for {L} layers."
+        )
     for i in range(L):
         slot_mapping = context_slot_mapping[i] if per_layer else context_slot_mapping
         if slot_mapping is None:
