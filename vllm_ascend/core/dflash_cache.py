@@ -170,6 +170,22 @@ def _pool_bytes_per_block(cache_config):
     return pool_bytes // cache_config.num_blocks
 
 
+def _cache_group_summary(cache_config) -> str:
+    summaries: list[str] = []
+    for index, group in enumerate(cache_config.kv_cache_groups):
+        spec = group.kv_cache_spec
+        specs = spec.kv_cache_specs.values() if isinstance(spec, UniformTypeKVCacheSpecs) else (spec,)
+        layouts = sorted(
+            {
+                f"{type(item).__name__}(block_size={item.block_size},"
+                f"sliding_window={getattr(item, 'sliding_window', None)})"
+                for item in specs
+            }
+        )
+        summaries.append(f"{index}:layers={len(group.layer_names)}," + "/".join(layouts))
+    return "; ".join(summaries)
+
+
 def wrap_dflash_cache_planner(original_planner):
     """Re-plan before allocation using both the real budget and FIA limits."""
 
@@ -181,8 +197,9 @@ def wrap_dflash_cache_planner(original_planner):
         if len(configs) != len(available_memory) or len(kv_cache_specs) != len(available_memory):
             raise ValueError("Mixed DFlash requires a cache plan and memory budget for every worker.")
         limits: list[int] = []
+        capacity_diagnostics: list[tuple[int, int, int, int | None]] = []
         active_configs = []
-        for config, budget in zip(configs, available_memory):
+        for worker_index, (config, budget) in enumerate(zip(configs, available_memory)):
             specs = _layer_specs(config)
             if not specs or not any(isinstance(spec, MambaSpec) for spec in specs.values()):
                 continue
@@ -190,12 +207,14 @@ def wrap_dflash_cache_planner(original_planner):
             if any(aligned[name] != spec for name, spec in specs.items()):
                 raise ValueError("Mixed DFlash cache specs changed after alignment; refusing unsafe allocation.")
             active_configs.append(config)
-            limits.extend((config.num_blocks, budget // _pool_bytes_per_block(config)))
+            budget_limit = budget // _pool_bytes_per_block(config)
+            limits.extend((config.num_blocks, budget_limit))
+            fia_limits: list[int] = []
             for spec in specs.values():
                 if isinstance(spec, MambaSpec):
                     continue
                 dtype_bytes = get_dtype_size(spec.dtype)
-                limits.append(
+                fia_limits.append(
                     get_dflash_fia_safe_num_blocks(
                         storage_block_size=spec.block_size,
                         key_row_bytes=spec.num_kv_heads * spec.head_size * dtype_bytes,
@@ -204,6 +223,10 @@ def wrap_dflash_cache_planner(original_planner):
                         value_element_bytes=dtype_bytes,
                     )
                 )
+            # Keep diagnostic accounting on the startup path; no device reads.
+            fia_limit = min(fia_limits) if fia_limits else None
+            limits.extend(fia_limits)
+            capacity_diagnostics.append((worker_index, config.num_blocks, budget_limit, fia_limit))
         if not active_configs:
             return configs
         safe_blocks = min(limits)
@@ -233,6 +256,23 @@ def wrap_dflash_cache_planner(original_planner):
             aligned = align_dflash_cache_specs(vllm_config, specs)
             if any(aligned[name] != spec for name, spec in specs.items()):
                 raise ValueError("Replanned mixed DFlash KV cache lost its aligned layout.")
+        for worker_index, original_blocks, budget_limit, fia_limit in capacity_diagnostics:
+            config = configs[worker_index]
+            logger.info(
+                "DFlash mixed cache capacity: worker=%d, original_planned_blocks=%d, "
+                "budget_limit_blocks=%d, fia_limit_blocks=%s, override=%s, effective_blocks=%d, "
+                "pool_bytes=%d, budget_bytes=%d, groups=%d [%s]",
+                worker_index,
+                original_blocks,
+                budget_limit,
+                fia_limit,
+                vllm_config.cache_config.num_gpu_blocks_override,
+                config.num_blocks,
+                config.num_blocks * _pool_bytes_per_block(config),
+                available_memory[worker_index],
+                len(config.kv_cache_groups),
+                _cache_group_summary(config),
+            )
         logger.info(
             "DFlash mixed cache plan ready: physical_blocks=%d (memory/address safe)",
             min(config.num_blocks for config in configs if config.kv_cache_groups),

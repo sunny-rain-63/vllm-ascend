@@ -44,6 +44,7 @@ class _SlidingWindowSpec(_FullAttentionSpec):
 
 @dataclass(frozen=True)
 class _MambaSpec:
+    block_size: int = 122880
     shapes: tuple = ((5120, 10), (24, 128, 128))
     dtypes: tuple = ("torch.bfloat16", "torch.float32")
     page_size_padded: int | None = None
@@ -144,6 +145,13 @@ class TestDFlashCache(unittest.TestCase):
 
         return self.impl.wrap_dflash_cache_planner(original), calls
 
+    def _capacity_logs(self):
+        return [
+            call.args[0] % call.args[1:]
+            for call in self.impl.logger.info.call_args_list
+            if call.args[0].startswith("DFlash mixed cache capacity:")
+        ]
+
     def test_mixed_alignment_preserves_all_four_windows_and_spec_types(self):
         original = self._specs()
         aligned = self.impl.align_dflash_cache_specs(self.config, original)
@@ -194,6 +202,10 @@ class TestDFlashCache(unittest.TestCase):
         self.assertEqual(result[0].num_blocks, 4096)
         self.assertEqual(len(calls), 1)
         self.assertIs(calls[0], self.config)
+        (diagnostic,) = self._capacity_logs()
+        self.assertIn("original_planned_blocks=4096, budget_limit_blocks=9000, fia_limit_blocks=5461", diagnostic)
+        self.assertIn("override=4096, effective_blocks=4096", diagnostic)
+        self.assertIn(f"pool_bytes={4096 * self.pool_per_block}, budget_bytes={9000 * self.pool_per_block}", diagnostic)
 
     def test_fia_boundary_replans_9000_to_5461_without_mutating_config(self):
         self.config.cache_config.num_gpu_blocks_override = 9000
@@ -204,6 +216,14 @@ class TestDFlashCache(unittest.TestCase):
         self.assertIsNot(calls[1], self.config)
         self.assertIsNot(calls[1].cache_config, self.config.cache_config)
         self.assertEqual(self.config.cache_config.num_gpu_blocks_override, 9000)
+        (diagnostic,) = self._capacity_logs()
+        self.assertIn("original_planned_blocks=9000, budget_limit_blocks=9000, fia_limit_blocks=5461", diagnostic)
+        self.assertIn("override=9000, effective_blocks=5461", diagnostic)
+        self.assertIn("groups=3", diagnostic)
+        self.assertIn("0:layers=2,_FullAttentionSpec(block_size=1536,sliding_window=None)", diagnostic)
+        self.assertIn("1:layers=1,_MambaSpec(block_size=122880,sliding_window=None)", diagnostic)
+        self.assertIn("2:layers=4,_SlidingWindowSpec(block_size=1536,sliding_window=2048)", diagnostic)
+        self.assertNotIn("target.full", diagnostic)
 
     def test_override_is_also_limited_by_real_profiled_memory(self):
         self.config.cache_config.num_gpu_blocks_override = 9000
@@ -211,11 +231,22 @@ class TestDFlashCache(unittest.TestCase):
         result = planner(self.config, [{}], [3000 * self.pool_per_block + 1])
         self.assertEqual(result[0].num_blocks, 3000)
         self.assertEqual(calls[1].cache_config.num_gpu_blocks_override, 3000)
+        (diagnostic,) = self._capacity_logs()
+        self.assertIn("budget_limit_blocks=3000, fia_limit_blocks=5461", diagnostic)
+        self.assertIn("effective_blocks=3000", diagnostic)
+        self.assertIn(
+            f"pool_bytes={3000 * self.pool_per_block}, budget_bytes={3000 * self.pool_per_block + 1}", diagnostic
+        )
 
     def test_minimum_rank_budget_applies_to_all_workers(self):
         planner, _ = self._planner(counts=(9000, 8000))
         result = planner(self.config, [{}, {}], [7000 * self.pool_per_block, 3500 * self.pool_per_block])
         self.assertEqual([plan.num_blocks for plan in result], [3500, 3500])
+        diagnostics = self._capacity_logs()
+        self.assertEqual(len(diagnostics), 2)
+        self.assertIn("worker=0, original_planned_blocks=9000, budget_limit_blocks=7000", diagnostics[0])
+        self.assertIn("worker=1, original_planned_blocks=8000, budget_limit_blocks=3500", diagnostics[1])
+        self.assertTrue(all("effective_blocks=3500" in diagnostic for diagnostic in diagnostics))
 
     def test_main_shared_descriptors_are_counted_once(self):
         plan = self._plan(9000)
@@ -288,6 +319,19 @@ class TestDFlashCache(unittest.TestCase):
         planner = self.impl.wrap_dflash_cache_planner(original)
         self.assertIs(planner(self.config, [], [1]), expected)
         original.assert_called_once_with(self.config, [], [1])
+        self.assertEqual(self._capacity_logs(), [])
+
+    def test_mixed_attention_without_mamba_has_no_capacity_diagnostics(self):
+        plan = self._plan(9000)
+        plan.kv_cache_groups = [
+            group for group in plan.kv_cache_groups if not isinstance(group.kv_cache_spec, _MambaSpec)
+        ]
+        expected = [plan]
+        original = Mock(return_value=expected)
+        planner = self.impl.wrap_dflash_cache_planner(original)
+        self.assertIs(planner(self.config, [{}], [1]), expected)
+        self.assertEqual(plan.num_blocks, 9000)
+        self.assertEqual(self._capacity_logs(), [])
 
 
 if __name__ == "__main__":
