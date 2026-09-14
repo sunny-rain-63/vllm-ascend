@@ -90,7 +90,9 @@ The number of cache groups, padding, and request lengths also matter.
 
 The startup-only `DFlash mixed cache capacity:` log reports each worker's
 `original_planned_blocks`, `budget_limit_blocks`, `fia_limit_blocks`, `override`,
-`effective_blocks`, `pool_bytes`, `budget_bytes`, and group layouts. Use it with
+`effective_blocks`, `pool_bytes`, `budget_bytes`, and group layouts. The original
+`budget_limit_blocks` uses the original pool width; after regrouping,
+`effective_budget_limit_blocks` uses the selected pool width. Use these with
 Running/Waiting, cache usage, and preemption counts. The group block sizes are
 storage sizes, not the 128-token attention kernel block size. Do not infer a
 request concurrency limit by multiplying `effective_blocks` by 1536: requests
@@ -117,12 +119,73 @@ The `fix_swa3` hot-path changes preserve all layout and capacity protections:
   across steps, and source mappings are not modified. CPU and nonstandard
   tensor layouts retain the original PyTorch expression.
 
-These changes reduce preparation work; they do not raise the resident-request
-limit, change grouping, or guarantee that mixed attention outperforms full
-attention. A remaining capacity bottleneck needs a separate grouping/pool
-design or a validated operator fix, not removal of the safety cap.
+These first-stage changes reduce preparation work; by themselves they do not
+raise the resident-request limit or change grouping. The additional changes
+below address capacity and metadata overhead without removing the safety cap.
 The vectorized input preparation also applies to unmixed V2 DFlash; the fused
 write guard remains scoped to the mixed cache repair.
+
+### Budget-aware grouping and exact metadata reuse
+
+The reported run on vLLM `a97dacb710` has 69 singleton groups: 16 target Full,
+4 draft SWA, 1 draft Full, and 48 target Mamba. At a page size of 3,248,128
+bytes, the FIA cap of 5461 blocks limits the one-column pool to
+17,738,027,008 bytes, despite a 26,556,098,560-byte budget. Approximately
+8.21 GiB is therefore unavailable to the scheduler.
+
+The planner now compares wider groups with the original layout, keeping exact
+cache specs, group metadata, and target/draft ownership separate. It chooses
+a candidate only if it strictly improves the initialization admission-capacity
+estimate within the same memory, FIA, and explicit override limits. It does
+not blindly maximize group width. For the supplied budget, the metadata test
+selects 35 groups in two pool columns and 4087 physical blocks per column:
+26,550,198,272 bytes in total. The smaller block count does **not** indicate
+less capacity: the pool is twice as wide and requests consume fewer groups.
+The storage block remains 1536, kernel block 128, and SWA window 2048.
+
+Loaded draft layer names are carried in the worker spec RPC and copied into
+the local planner call before upstream merges the dictionaries. This correctly
+sets `is_eagle_group` on draft groups without flagging the target Mamba groups.
+The warning that all groups are treated as draft should disappear. This is a
+prefix-cache lookup classification fix; the warning did not mean that Mamba
+layers were being executed as draft layers. With no explicit loaded identity,
+the planner retains the previous safe layout rather than guessing layer names.
+
+Two additional preparation optimizations preserve exact lengths and masks:
+
+- Ordinary V2 parallel-drafting attention builders share one exact device
+  `seq_lens.tolist()` result within a single metadata build. They do not use
+  CPU upper bounds. Every group receives its own list for FIA padding, and
+  the next build always reads fresh device lengths.
+- FULL-graph DFlash replay consumes the metadata already built in the same
+  `propose` call when real and padded request/token counts match. Capture,
+  profile, dummy, and mismatched-descriptor paths rebuild. References are
+  cleared on normal return and exceptions; nothing is reused across steps.
+
+These metadata optimizations also apply to other ordinary V2 parallel-drafting
+attention / V2 DFlash configurations, respectively. Grouping and draft-role
+propagation are scoped to mixed-window DFlash. No sampling, weights, attention
+window, or cache-address protection is changed. Runtime speedup and output
+equivalence still require NPU validation; CPU contract tests cannot establish
+either.
+
+For approximately the supplied budget, verify the startup markers below before
+running another full GPQA evaluation. Actual counts depend on the new profiling
+budget; the final view check must still report all 69 layers, not 35 layers.
+
+```text
+DFlash mixed cache regrouped: groups=69 -> 35, pool_width=1 -> 2, physical_blocks=4087, draft_groups=3 (same specs and FIA limit)
+DFlash mixed cache plan ready: physical_blocks=4087 (memory/address safe)
+DFlash mixed cache views verified: layers=69, physical_blocks=4087, ...
+```
+
+Keep the reported FULL-graph mode, concurrency 32, and no explicit block
+override for the performance comparison. The automatic FIA cap remains active.
+First check a previously failing long-output GPQA subset (including request
+reuse and padding at concurrency 1 and 32), then the 198-case run. Disable
+per-step DFlash/Mamba debug output when timing. Save total generated tokens,
+not only case progress or acceptance length, and compare the same mixed model
+on the old and new code before comparing with all-full attention.
 
 ## Performance validation
 
@@ -132,6 +195,10 @@ it cannot validate Triton compilation, NPU latency, or graph execution.
 
 ```bash
 python tests/ut/worker/test_dflash_cache.py
+python tests/ut/worker/test_dflash_cache_grouping.py
+python tests/ut/worker/test_dflash_cache_planning.py
+python tests/ut/worker/test_dflash_metadata_reuse.py
+python tests/ut/attention/test_exact_seq_lens_cache.py
 python tests/ut/worker/test_dflash_prepare_inputs.py
 python tests/ut/ops/test_dflash_slot_mapping.py
 pytest -q tests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_dflash_slot_mapping.py

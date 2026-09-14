@@ -23,6 +23,37 @@ logger = logging.getLogger(__name__)
 
 
 class AscendDFlashSpeculator(DFlashSpeculator):
+    def _build_draft_attn_metadata(self, num_reqs, num_reqs_padded, num_tokens_padded, *args, **kwargs):
+        # Upstream builds this metadata immediately before dispatching the
+        # draft FULL graph. Keep only that call's result; a failed rebuild
+        # must not leave an earlier result available for replay.
+        self._current_propose_draft_metadata = None
+        metadata = super()._build_draft_attn_metadata(num_reqs, num_reqs_padded, num_tokens_padded, *args, **kwargs)
+        if getattr(self, "_reuse_draft_metadata_within_propose", False) and metadata is not None:
+            self._current_propose_draft_metadata = (num_reqs, num_reqs_padded, num_tokens_padded, metadata)
+        return metadata
+
+    def get_draft_attn_metadatas_for_replay(self, num_reqs_padded, num_tokens_padded, seq_lens_cpu_upper_bound):
+        """Consume metadata from this propose only, otherwise rebuild it."""
+        cached = getattr(self, "_current_propose_draft_metadata", None)
+        self._current_propose_draft_metadata = None
+        if (
+            getattr(self, "_reuse_draft_metadata_within_propose", False)
+            and cached is not None
+            and cached[:3] == (self.input_batch.num_reqs, num_reqs_padded, num_tokens_padded)
+        ):
+            metadata = cached[3]
+            # The upstream build stops the query offsets at the real request
+            # count. FIA still needs query rows for the graph's padded batch.
+            self._update_draft_attn_metadata(metadata, num_reqs_padded)
+            return [metadata]
+        try:
+            # Capture/profile/dummy paths and incompatible descriptors retain
+            # the existing build path, including its padded-query correction.
+            return self.build_draft_attn_metadatas(num_reqs_padded, seq_lens_cpu_upper_bound)
+        finally:
+            self._current_propose_draft_metadata = None
+
     def build_draft_attn_metadatas(self, num_reqs_padded, seq_lens_cpu_upper_bound):
         num_tokens_padded = num_reqs_padded * self.num_query_per_req
         with build_attn_metadata_wrapper():
@@ -57,6 +88,8 @@ class AscendDFlashSpeculator(DFlashSpeculator):
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         super().__init__(vllm_config, device)
+        self._reuse_draft_metadata_within_propose = False
+        self._current_propose_draft_metadata = None
 
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
         if self.speculative_config.enforce_eager:
@@ -127,33 +160,41 @@ class AscendDFlashSpeculator(DFlashSpeculator):
         dp_sync: Any = None,
     ) -> torch.Tensor:
         self.input_batch = input_batch
-        sync_state = num_tokens_across_dp if vllm_version_is("0.28.0") else dp_sync
-        if dummy_run and skip_attn_for_dummy_run:
-            # Profiling runs the draft with its own query token count, which
-            # can differ from the target batch. Let forward_context coordinate
-            # the actual draft counts instead of reusing the target DP state.
-            # TODO: Remove this guard once main2main includes upstream vLLM
-            # #54856 (facd9a74a1), which resets the profiling DP counts.
-            sync_state = None
-        with build_attn_metadata_wrapper():
-            return super().propose(
-                input_batch,
-                attn_metadata,
-                slot_mappings,
-                last_hidden_states,
-                aux_hidden_states,
-                num_sampled,
-                num_rejected,
-                last_sampled,
-                next_prefill_tokens,
-                temperature,
-                seeds,
-                sync_state,
-                dummy_run,
-                skip_attn_for_dummy_run,
-                mm_inputs,
-                is_profile=is_profile,
-            )
+        self._current_propose_draft_metadata = None
+        self._reuse_draft_metadata_within_propose = not dummy_run and not is_profile
+        try:
+            sync_state = num_tokens_across_dp if vllm_version_is("0.28.0") else dp_sync
+            if dummy_run and skip_attn_for_dummy_run:
+                # Profiling runs the draft with its own query token count, which
+                # can differ from the target batch. Let forward_context coordinate
+                # the actual draft counts instead of reusing the target DP state.
+                # TODO: Remove this guard once main2main includes upstream vLLM
+                # #54856 (facd9a74a1), which resets the profiling DP counts.
+                sync_state = None
+            with build_attn_metadata_wrapper():
+                return super().propose(
+                    input_batch,
+                    attn_metadata,
+                    slot_mappings,
+                    last_hidden_states,
+                    aux_hidden_states,
+                    num_sampled,
+                    num_rejected,
+                    last_sampled,
+                    next_prefill_tokens,
+                    temperature,
+                    seeds,
+                    sync_state,
+                    dummy_run,
+                    skip_attn_for_dummy_run,
+                    mm_inputs,
+                    is_profile=is_profile,
+                )
+        finally:
+            # Metadata aliases live request buffers. Never reuse it across
+            # decode steps, even after an exception or an eager dispatch.
+            self._reuse_draft_metadata_within_propose = False
+            self._current_propose_draft_metadata = None
 
 
 # main2main compat: upstream ``_prepare_dflash_inputs_kernel`` added four

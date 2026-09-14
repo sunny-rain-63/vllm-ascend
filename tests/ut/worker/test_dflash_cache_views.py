@@ -15,6 +15,7 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
+    KVCacheTensor,
     MambaSpec,
     SlidingWindowSpec,
 )
@@ -117,6 +118,69 @@ def mixed_cache(monkeypatch):
     )
 
 
+@pytest.fixture
+def mixed_cache_width_two(mixed_cache, monkeypatch):
+    if "layers" not in KVCacheTensor.__dataclass_fields__:
+        pytest.skip("Requires standardized layer-strided KV cache descriptors")
+    config = mixed_cache.config
+    config.kv_transfer_config = None
+    names_by_type = {
+        FULL_LAYER: [FULL_LAYER, "model.layers.7.self_attn.attn"],
+        SWA_LAYER: [SWA_LAYER, "draft_model.layers.1.self_attn.attn"],
+        MAMBA_LAYER: [MAMBA_LAYER, "model.layers.1.linear_attn"],
+    }
+    groups = [
+        KVCacheGroupSpec(layer_names=names, kv_cache_spec=mixed_cache.specs[name])
+        for name, names in names_by_type.items()
+    ]
+    layer_bytes = NUM_BLOCKS * PAGE_BYTES
+    descriptors = [
+        KVCacheTensor(
+            size=2 * layer_bytes,
+            layers=list(group.layer_names),
+            layer_stride=layer_bytes,
+            block_stride=PAGE_BYTES,
+            offset=0,
+        )
+        for group in groups
+    ]
+    cache_config = KVCacheConfig(num_blocks=NUM_BLOCKS, kv_cache_tensors=descriptors, kv_cache_groups=groups)
+    specs = {name: group.kv_cache_spec for group in groups for name in group.layer_names}
+    layers = {name: SimpleNamespace(impl=SimpleNamespace()) for name in specs}
+    monkeypatch.setattr(attn_utils, "get_layers_from_vllm_config", lambda *_args, **_kwargs: layers)
+    monkeypatch.setattr(attn_utils, "KVPPConfig", SimpleNamespace(from_vllm_config=lambda _: SimpleNamespace(size=1)))
+    monkeypatch.setattr(attn_utils, "vllm_version_is", lambda _: False)
+    # Exercise the production allocator, not only hand-constructed aliases:
+    # three descriptors must overlay ONE two-layer backing allocation.
+    raw = attn_utils._allocate_kv_cache(cache_config, shared_layers={}, device=torch.device("cpu"))
+    attention_groups = [
+        AttentionGroup(
+            backend=AscendAttentionBackend,
+            layer_names=group.layer_names,
+            kv_cache_spec=group.kv_cache_spec,
+            kv_cache_group_id=index,
+        )
+        for index, group in enumerate(groups)
+    ]
+    caches = attn_utils._reshape_kv_cache_v2(
+        attn_groups=attention_groups,
+        kv_cache_raw_tensors=raw,
+        cache_dtype="auto",
+        kernel_block_sizes=[KERNEL_BLOCK_SIZE] * len(groups),
+        shared_kv_cache_layers={},
+        kv_cache_config=cache_config,
+    )
+    return SimpleNamespace(
+        config=config,
+        cache_config=cache_config,
+        specs=specs,
+        names_by_type=names_by_type,
+        raw=raw,
+        caches=caches,
+        layers=layers,
+    )
+
+
 def _physical_attention_view(cache, spec):
     return cache.view(NUM_BLOCKS, STORAGE_BLOCK_SIZE, spec.num_kv_heads, spec.head_size)
 
@@ -184,6 +248,69 @@ def test_swa_block_one_cannot_overwrite_other_full_or_mamba_blocks(mixed_cache):
     assert torch.all(state[2] == 9)
     assert torch.all(swa_key[1] == 33)
     assert torch.all(swa_value[1] == 44)
+
+
+def test_width_two_allocator_uses_one_backing_with_separate_layer_arenas(mixed_cache_width_two):
+    fixture = mixed_cache_width_two
+    layer_bytes = NUM_BLOCKS * PAGE_BYTES
+    storages = {raw.untyped_storage().data_ptr() for raw in fixture.raw.values()}
+    assert len(storages) == 1
+    base = next(iter(storages))
+    for names in fixture.names_by_type.values():
+        for index, name in enumerate(names):
+            raw = fixture.raw[name]
+            assert raw.untyped_storage().nbytes() == 2 * layer_bytes
+            assert raw.numel() * raw.element_size() == layer_bytes
+            assert raw.data_ptr() - base == index * layer_bytes
+    validate_dflash_cache_views(fixture.config, fixture.cache_config, fixture.raw, fixture.caches)
+
+
+def test_width_two_same_group_layers_keep_independent_state(mixed_cache_width_two):
+    fixture = mixed_cache_width_two
+    for names in fixture.names_by_type.values():
+        # Both layers use the SAME physical block ID in one group's table,
+        # but own different layer arenas within the standardized backing.
+        for component in range(2):
+            first, second = (fixture.caches[name][component] for name in names)
+            if names[0] != MAMBA_LAYER:
+                first = _physical_attention_view(first, fixture.specs[names[0]])
+                second = _physical_attention_view(second, fixture.specs[names[1]])
+            first[3].fill_(11 + component)
+            second[3].fill_(21 + component)
+            assert torch.all(first[3] == 11 + component)
+            assert torch.all(second[3] == 21 + component)
+
+
+def test_width_two_cross_group_writes_preserve_other_physical_blocks(mixed_cache_width_two):
+    fixture = mixed_cache_width_two
+    for index in range(2):
+        full_name = fixture.names_by_type[FULL_LAYER][index]
+        swa_name = fixture.names_by_type[SWA_LAYER][index]
+        mamba_name = fixture.names_by_type[MAMBA_LAYER][index]
+        full_key, full_value = [
+            _physical_attention_view(cache, fixture.specs[full_name]) for cache in fixture.caches[full_name]
+        ]
+        swa_key, swa_value = [
+            _physical_attention_view(cache, fixture.specs[swa_name]) for cache in fixture.caches[swa_name]
+        ]
+        conv, state = fixture.caches[mamba_name]
+        # Within each layer arena, groups still share backing bytes and rely
+        # on distinct live physical IDs. Check both historical alias victims.
+        full_value[10].fill_(11)
+        full_value[11].fill_(22)
+        full_key[3].fill_(55)
+        conv[2].fill_(7)
+        state[2].fill_(9)
+        swa_key[1].fill_(33)
+        swa_value[1].fill_(44)
+        assert torch.all(full_value[10] == 11)
+        assert torch.all(full_value[11] == 22)
+        assert torch.all(full_key[3] == 55)
+        assert torch.all(conv[2] == 7)
+        assert torch.all(state[2] == 9)
+        assert torch.all(swa_key[1] == 33)
+        assert torch.all(swa_value[1] == 44)
+    validate_dflash_cache_views(fixture.config, fixture.cache_config, fixture.raw, fixture.caches)
 
 
 def test_view_validation_rejects_wrong_actual_dtype(mixed_cache):

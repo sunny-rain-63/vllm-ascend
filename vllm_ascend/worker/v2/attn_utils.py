@@ -48,6 +48,7 @@ from vllm_ascend.attention.dsa_v1 import AscendDSAMetadataBuilder
 from vllm_ascend.attention.sfa_v1 import AscendSFAMetadataBuilder
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
+    ExactSeqLensListCache,
     get_sfa_qsfa_packed_head_dim,
 )
 from vllm_ascend.core.dflash_cache import (
@@ -247,6 +248,11 @@ def build_attn_metadata(
         positions = torch.zeros(num_input_tokens, dtype=torch.int64, device=query_start_loc_gpu.device)
 
     attn_metadata: dict[str, Any] = {}
+    # Only ordinary parallel-draft Ascend builders consume this cache. Keep
+    # both the shared tensor view and its host-list cache local to this build:
+    # rejected-token updates change the same device buffer on the next step.
+    common_seq_lens = seq_lens[:num_reqs]
+    exact_seq_lens_list_cache = ExactSeqLensListCache()
     # Share request-level DSA metadata across cache groups in one execution.
     common_ratio_to_sas_metadata: dict[Any, Any] = {}
     kv_cache_groups = kv_cache_config.kv_cache_groups
@@ -270,7 +276,8 @@ def build_attn_metadata(
             query_start_loc_cpu=query_start_loc_cpu,
             seq_lens_cpu=seq_lens_cpu,
             seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
-            seq_lens=seq_lens[:num_reqs],
+            seq_lens=common_seq_lens,
+            exact_seq_lens_list_cache=exact_seq_lens_list_cache,
             num_reqs=num_reqs,
             num_actual_tokens=num_actual_tokens,
             max_query_len=max_query_len,

@@ -68,6 +68,7 @@ def _load_production():
     namespace = dict(
         logger=Mock(),
         get_dtype_size=_dtype_size,
+        KVCacheSpec=object,
         FullAttentionSpec=_FullAttentionSpec,
         SlidingWindowSpec=_SlidingWindowSpec,
         MambaSpec=_MambaSpec,

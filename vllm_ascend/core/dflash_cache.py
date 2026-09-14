@@ -10,11 +10,13 @@ from vllm.logger import logger
 from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
+    KVCacheSpec,
     MambaSpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
 
+from vllm_ascend.core.dflash_cache_grouping import choose_dflash_cache_groups
 from vllm_ascend.core.dflash_cache_layout import (
     get_dflash_aligned_block_size,
     get_dflash_fia_safe_num_blocks,
@@ -29,6 +31,71 @@ def uses_mixed_dflash_cache(vllm_config) -> bool:
     draft_config = getattr(draft_model_config, "hf_config", None)
     layer_types = getattr(draft_config, "layer_types", None) or ()
     return "sliding_attention" in layer_types and "full_attention" in layer_types
+
+
+class DFlashKVCacheSpecs(dict[str, KVCacheSpec]):
+    """Carry loaded draft ownership through the worker's pickled spec RPC.
+
+    Spec objects remain ordinary upstream dataclasses (including across
+    ``replace`` and registry checks). Names come from the loaded speculator,
+    never from a layer-name prefix or an assumption about the target depth.
+    """
+
+    def __init__(self, specs: dict[str, KVCacheSpec], draft_layer_names: set[str]):
+        super().__init__(specs)
+        self.draft_layer_names = frozenset(draft_layer_names)
+
+
+def _with_dflash_draft_layers(vllm_config, specs):
+    names = getattr(specs, "draft_layer_names", None)
+    if not uses_mixed_dflash_cache(vllm_config) or not names:
+        return vllm_config
+    if not names <= specs.keys() or any(isinstance(specs[name], MambaSpec) for name in names):
+        raise ValueError("Mixed DFlash requires valid loaded draft attention layer names.")
+    config = copy.copy(vllm_config)
+    config._ascend_dflash_draft_layer_names = names
+    return config
+
+
+def annotate_dflash_cache_groups(vllm_config, groups):
+    names = getattr(vllm_config, "_ascend_dflash_draft_layer_names", None)
+    if uses_mixed_dflash_cache(vllm_config) and names:
+        for group in groups:
+            group.is_eagle_group = any(name in names for name in group.layer_names)
+
+
+def wrap_dflash_cache_group_annotation(original_annotation):
+    @wraps(original_annotation)
+    def annotate(vllm_config, kv_cache_spec, kv_cache_groups, *args, **kwargs):
+        original_annotation(vllm_config, kv_cache_spec, kv_cache_groups, *args, **kwargs)
+        # Run before upstream's unannotated-drafter warning and before the
+        # group projection that transports this flag to the scheduler.
+        annotate_dflash_cache_groups(vllm_config, kv_cache_groups)
+
+    return annotate
+
+
+def wrap_dflash_cache_group_builder(original_builder):
+    @wraps(original_builder)
+    def build(vllm_config, kv_cache_spec):
+        config = _with_dflash_draft_layers(vllm_config, kv_cache_spec)
+        selected = getattr(config, "_ascend_dflash_cache_groups", None)
+        if uses_mixed_dflash_cache(config) and selected is not None:
+            names = [name for group in selected for name in group.layer_names]
+            if (
+                len(names) != len(kv_cache_spec)
+                or set(names) != kv_cache_spec.keys()
+                or any(kv_cache_spec[name] != group.kv_cache_spec for group in selected for name in group.layer_names)
+            ):
+                raise ValueError("Mixed DFlash regrouping changed cache layer coverage or specs.")
+            return [replace(group, layer_names=list(group.layer_names)) for group in selected]
+        groups = original_builder(config, kv_cache_spec)
+        # Also covers upstream grouping fast paths and releases without an
+        # annotation helper. No identity guesses if the worker sent no names.
+        annotate_dflash_cache_groups(config, groups)
+        return groups
+
+    return build
 
 
 def align_dflash_cache_specs(vllm_config, specs):
@@ -191,6 +258,16 @@ def wrap_dflash_cache_planner(original_planner):
 
     @wraps(original_planner)
     def plan(vllm_config, kv_cache_specs, available_memory):
+        if uses_mixed_dflash_cache(vllm_config) and kv_cache_specs:
+            worker_draft_names = [getattr(specs, "draft_layer_names", None) for specs in kv_cache_specs]
+            if any(worker_draft_names):
+                if any(names != worker_draft_names[0] for names in worker_draft_names):
+                    raise ValueError("Mixed DFlash workers disagree on loaded draft cache layers.")
+                for specs in kv_cache_specs:
+                    _with_dflash_draft_layers(vllm_config, specs)
+                # Upstream merges the worker dictionaries into a plain dict.
+                # Keep ownership on this call-local config through that merge.
+                vllm_config = _with_dflash_draft_layers(vllm_config, kv_cache_specs[0])
         configs = original_planner(vllm_config, kv_cache_specs, available_memory)
         if not uses_mixed_dflash_cache(vllm_config):
             return configs
@@ -232,7 +309,42 @@ def wrap_dflash_cache_planner(original_planner):
         safe_blocks = min(limits)
         if safe_blocks < 2:
             raise ValueError("No safe mixed DFlash KV cache blocks fit the available memory.")
-        if any(config.num_blocks > safe_blocks for config in active_configs):
+        selected_groups = None
+        draft_names = getattr(vllm_config, "_ascend_dflash_draft_layer_names", None)
+        if draft_names and len(active_configs) == len(configs):
+            specs = _layer_specs(configs[0])
+            if all(
+                _layer_specs(config) == specs and config.kv_cache_groups == configs[0].kv_cache_groups
+                for config in configs
+            ):
+                selected_groups = choose_dflash_cache_groups(
+                    vllm_config,
+                    specs,
+                    configs[0].kv_cache_groups,
+                    draft_layer_names=set(draft_names),
+                    available_memory=min(available_memory),
+                    max_num_blocks=safe_blocks,
+                )
+        if selected_groups is not None:
+            # A wider pool uses more bytes per physical block. Apply the real
+            # budget BEFORE upstream admission/descriptor construction, not
+            # after allocation. The per-plane FIA limit is unchanged.
+            pool_bytes = (
+                max(len(group.layer_names) for group in selected_groups)
+                * selected_groups[0].kv_cache_spec.page_size_bytes
+            )
+            safe_blocks = min(safe_blocks, min(available_memory) // pool_bytes)
+            logger.info(
+                "DFlash mixed cache regrouped: groups=%d -> %d, pool_width=%d -> %d, "
+                "physical_blocks=%d, draft_groups=%d (same specs and FIA limit)",
+                len(configs[0].kv_cache_groups),
+                len(selected_groups),
+                max(len(group.layer_names) for group in configs[0].kv_cache_groups),
+                max(len(group.layer_names) for group in selected_groups),
+                safe_blocks,
+                sum(group.is_eagle_group for group in selected_groups),
+            )
+        if selected_groups is not None or any(config.num_blocks > safe_blocks for config in active_configs):
             logger.warning(
                 "DFlash mixed cache guard: physical_blocks=%d -> %d; "
                 "applying the profiled memory budget and FIA address limits before allocation.",
@@ -242,12 +354,16 @@ def wrap_dflash_cache_planner(original_planner):
             safe_config = copy.copy(vllm_config)
             safe_config.cache_config = copy.copy(vllm_config.cache_config)
             safe_config.cache_config.num_gpu_blocks_override = safe_blocks
+            if selected_groups is not None:
+                safe_config._ascend_dflash_cache_groups = selected_groups
             # Re-run admission, auto-fit and descriptor construction together.
             # In particular, offsets/layer strides on main depend on num_blocks.
             configs = original_planner(safe_config, kv_cache_specs, available_memory)
         if len(configs) != len(available_memory):
             raise ValueError("Replanned mixed DFlash cache is missing worker plans.")
         for config, budget in zip(configs, available_memory):
+            if selected_groups is not None and config.kv_cache_groups != selected_groups:
+                raise ValueError("Replanned mixed DFlash KV cache lost its selected groups or draft ownership.")
             specs = _layer_specs(config)
             if not specs:
                 continue
@@ -261,7 +377,7 @@ def wrap_dflash_cache_planner(original_planner):
             logger.info(
                 "DFlash mixed cache capacity: worker=%d, original_planned_blocks=%d, "
                 "budget_limit_blocks=%d, fia_limit_blocks=%s, override=%s, effective_blocks=%d, "
-                "pool_bytes=%d, budget_bytes=%d, groups=%d [%s]",
+                "pool_bytes=%d, budget_bytes=%d, effective_budget_limit_blocks=%d, groups=%d [%s]",
                 worker_index,
                 original_blocks,
                 budget_limit,
@@ -270,6 +386,7 @@ def wrap_dflash_cache_planner(original_planner):
                 config.num_blocks,
                 config.num_blocks * _pool_bytes_per_block(config),
                 available_memory[worker_index],
+                available_memory[worker_index] // _pool_bytes_per_block(config),
                 len(config.kv_cache_groups),
                 _cache_group_summary(config),
             )
