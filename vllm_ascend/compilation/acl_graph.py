@@ -16,7 +16,7 @@ from vllm.compilation.counter import compilation_counter
 from vllm.compilation.cuda_graph import CUDAGraphOptions
 from vllm.compilation.monitor import validate_cudagraph_capturing_enabled
 from vllm.config import CUDAGraphMode, VllmConfig
-from vllm.forward_context import BatchDescriptor, get_forward_context
+from vllm.forward_context import BatchDescriptor, get_forward_context, is_forward_context_available
 from vllm.logger import logger
 from vllm.platforms import current_platform
 
@@ -148,6 +148,13 @@ class ACLGraphWrapper:
         return self.runnable
 
     def __call__(self, *args, **kwargs):
+        if not is_forward_context_available():
+            # No forward context means we are outside the normal inference
+            # path (e.g. the DFlash2 candidate_selector call in
+            # _generate_draft, which runs after the draft model's forward
+            # context has exited). Just run the underlying function without
+            # aclgraphs, mirroring upstream CUDAGraphWrapper.
+            return self.runnable(*args, **kwargs)
         forward_context = get_forward_context()
         batch_descriptor = forward_context.batch_descriptor
         aclgraph_runtime_mode = forward_context.cudagraph_runtime_mode
