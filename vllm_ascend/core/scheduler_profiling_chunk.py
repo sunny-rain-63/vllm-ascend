@@ -30,10 +30,16 @@ from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.output import (
-    KVConnectorBlockState,
     NewRequestData,
     SchedulerOutput,
 )
+
+from vllm_ascend.utils import vllm_version_is
+
+if not vllm_version_is("0.28.0"):
+    from vllm.v1.core.sched.output import KVConnectorBlockState
+else:
+    KVConnectorBlockState = None  # type: ignore[misc, assignment]
 from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.engine import EngineCoreEventType
@@ -82,8 +88,24 @@ class ProfilingChunkScheduler(Scheduler):
         from vllm_ascend.ascend_config import get_ascend_config, init_ascend_config
 
         init_ascend_config(vllm_config)
-        profiling_cfg = get_ascend_config().scheduler_config.profiling_chunk_config
+        scheduler_extension_config = get_ascend_config().scheduler_config
+
+        profiling_cfg = scheduler_extension_config.profiling_chunk_config
         self.profiling_chunk_config = profiling_cfg
+
+        short_request_first_config = scheduler_extension_config.short_request_first_config
+        self._short_request_first_enabled = short_request_first_config.enabled
+
+        if self._short_request_first_enabled:
+            from vllm_ascend.core.short_request_first_scheduler import (
+                install_short_request_first_waiting_queue,
+            )
+
+            install_short_request_first_waiting_queue(
+                self,
+                threshold=short_request_first_config.threshold,
+                long_max_wait_ms=short_request_first_config.long_max_wait_ms,
+            )
         base_chunk = self.max_num_scheduled_tokens
 
         self.profiling_chunk_manager = ProfilingChunkManager(
@@ -732,32 +754,26 @@ class ProfilingChunkScheduler(Scheduler):
 
         # Drain every step, including without a connector, to avoid stale
         # Mamba boundary offers. Snapshot exact current block tables for the
-        # connector before building its metadata.
-        boundary_state_offloads = self.kv_cache_manager.take_boundary_state_offloads()
-
+        # connector before building its metadata. (vLLM main only)
         kv_connector_block_state = None
-        if self.connector is not None:
-            snapshot_req_ids = {req.req_id for req in new_reqs_data}
-            snapshot_req_ids.update(
-                req_id
-                for req_id, block_ids in zip(
-                    cached_reqs_data.req_ids,
-                    cached_reqs_data.new_block_ids,
-                    strict=True,
+        if KVConnectorBlockState is not None:
+            boundary_state_offloads = self.kv_cache_manager.take_boundary_state_offloads()
+            if self.connector is not None:
+                # A scheduled request can finish a cache chunk without allocating
+                # new blocks. Resolve its current table only when the connector reads it.
+                block_state_req_ids = set(num_scheduled_tokens)
+                block_state_req_ids.update(req_id for req_id in boundary_state_offloads if req_id in self.requests)
+                kv_connector_block_state = KVConnectorBlockState(
+                    req_ids=block_state_req_ids,
+                    resolve_block_ids=self.kv_cache_manager.get_block_ids,
+                    boundary_state_offloads=boundary_state_offloads,
                 )
-                if block_ids
-            )
-            snapshot_req_ids.update(req_id for req_id in boundary_state_offloads if req_id in self.requests)
-            kv_connector_block_state = KVConnectorBlockState(
-                block_ids={req_id: self.kv_cache_manager.get_block_ids(req_id) for req_id in snapshot_req_ids},
-                boundary_state_offloads=boundary_state_offloads,
-            )
 
         new_block_ids_to_zero = (
             (self.kv_cache_manager.take_new_block_ids() or None) if self.needs_kv_cache_zeroing else None
         )
 
-        scheduler_output = SchedulerOutput(
+        scheduler_output_kwargs = dict(
             scheduled_new_reqs=new_reqs_data,
             scheduled_cached_reqs=cached_reqs_data,
             num_scheduled_tokens=num_scheduled_tokens,
@@ -769,8 +785,10 @@ class ProfilingChunkScheduler(Scheduler):
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             new_block_ids_to_zero=new_block_ids_to_zero,
-            kv_connector_block_state=kv_connector_block_state,
         )
+        if KVConnectorBlockState is not None:
+            scheduler_output_kwargs["kv_connector_block_state"] = kv_connector_block_state
+        scheduler_output = SchedulerOutput(**scheduler_output_kwargs)
 
         if self.connector is not None:
             meta = self._build_kv_connector_meta(self.connector, scheduler_output)
@@ -781,7 +799,8 @@ class ProfilingChunkScheduler(Scheduler):
             scheduler_output.ec_connector_metadata = ec_meta
 
         # Connector-only block state must not be dispatched to workers.
-        scheduler_output.kv_connector_block_state = None
+        if KVConnectorBlockState is not None:
+            scheduler_output.kv_connector_block_state = None
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)

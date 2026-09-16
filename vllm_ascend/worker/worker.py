@@ -68,8 +68,12 @@ from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 from vllm.v1.worker.workspace import init_workspace_manager
 
 import vllm_ascend.envs as envs_ascend
-from vllm_ascend.ascend_config import get_ascend_config, init_ascend_config
+from vllm_ascend.ascend_config import KVPPConfig, get_ascend_config, init_ascend_config
 from vllm_ascend.batch_invariant import init_batch_invariance
+from vllm_ascend.core.kv_cache_placement import (
+    KVPPPhysicalCachePlan,
+    create_kvpp_cache_allocation_plan,
+)
 from vllm_ascend.core.profiling_chunk_predictor import (
     _attach_profiling_chunk_execution_time,
 )
@@ -94,6 +98,7 @@ from vllm_ascend.utils import (
     enable_sp,
     register_ascend_customop,
     setup_ascend_local_comm_res,
+    vllm_version_is,
 )
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
@@ -189,6 +194,7 @@ class NPUWorker(WorkerBase):
             WEIGHT_LOADER_V2_SUPPORTED.remove("UnquantizedLinearMethod")
 
         self.use_v2_model_runner = self.vllm_config.use_v2_model_runner
+        self._kvpp_cache_allocation_plan: KVPPPhysicalCachePlan | None = None
         self._pp_send_work: list[Handle] = []
 
         ascend_compilation_config = get_ascend_config().ascend_compilation_config
@@ -291,6 +297,10 @@ class NPUWorker(WorkerBase):
                 if name in self._sleep_saved_buffers:
                     buffer.data.copy_(self._sleep_saved_buffers[name].data)
             self._sleep_saved_buffers = {}
+
+        # vLLM main removed the post-KV-cache wake hook; keep it on v0.28.0.
+        if (tags is None or "kv_cache" in tags) and vllm_version_is("0.28.0"):
+            self.model_runner.post_kv_cache_wake_up()
 
         rl_config = get_ascend_config().rl_config
         cleanup_enabled = rl_config.enabled and rl_config.sleep_mode_extra_cleanup
@@ -540,6 +550,14 @@ class NPUWorker(WorkerBase):
         )
         return int(budget.final_planner_bytes)
 
+    def _apply_kvpp_memory_budget(self, available_bytes: int) -> int:
+        self.available_kv_cache_memory_bytes = available_bytes
+        plan = self._kvpp_cache_allocation_plan
+        if plan is None:
+            return available_bytes
+        num_blocks = plan.get_num_blocks(available_bytes)
+        return num_blocks * sum(spec.page_size_bytes for spec in plan.logical_cache_spec.values())
+
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
         """Profiles the peak memory usage of the model to determine how much
@@ -569,7 +587,9 @@ class NPUWorker(WorkerBase):
                 GiB(self.init_snapshot.free_memory),
                 GiB(kv_cache_memory_bytes),
             )
-            return self._apply_kv_offload_decode_memory_constraints(kv_cache_memory_bytes)
+            return self._apply_kvpp_memory_budget(
+                self._apply_kv_offload_decode_memory_constraints(kv_cache_memory_bytes)
+            )
 
         # Execute a forward pass with dummy inputs to profile the memory usage
         # of the model.
@@ -638,8 +658,7 @@ class NPUWorker(WorkerBase):
         self.available_kv_cache_memory_bytes = self._apply_kv_offload_decode_memory_constraints(
             self.available_kv_cache_memory_bytes
         )
-
-        return int(self.available_kv_cache_memory_bytes)
+        return self._apply_kvpp_memory_budget(self.available_kv_cache_memory_bytes)
 
     def _scale_kv_cache_memory_for_multi_group(self, available_memory: int) -> int:
         """Scale the KV cache budget for vllm main's multi-group layout.
@@ -653,6 +672,11 @@ class NPUWorker(WorkerBase):
         derives a num_blocks (and block pool) small enough for the per-layer
         buffers to fit.
         """
+        # v0.28.0 keeps shared_by aliasing (one alloc per descriptor); the
+        # #51718 multi-group scale is main-only. Also avoids
+        # CacheConfig.get_resolved_kv_cache_layout which does not exist on release.
+        if vllm_version_is("0.28.0"):
+            return available_memory
         kv_cache_spec = self.get_kv_cache_spec()
         if not isinstance(kv_cache_spec, dict):
             return available_memory
@@ -807,9 +831,6 @@ class NPUWorker(WorkerBase):
 
     @torch.inference_mode()
     def sample_tokens(self, grammar_output: "GrammarOutput") -> ModelRunnerOutput | AsyncModelRunnerOutput:
-        if not self.use_v2_model_runner:
-            return self.model_runner.sample_tokens(grammar_output)
-
         output = self.model_runner.sample_tokens(grammar_output)
         _attach_profiling_chunk_execution_time(
             self.model_runner.ascend_config.scheduler_config.profiling_chunk_config,
@@ -1089,6 +1110,14 @@ class NPUWorker(WorkerBase):
             self._gva_layerwise_memory_info = self._get_layerwise_kv_cache_memory_info(
                 kv_cache_spec,
                 extra_config,
+            )
+        kvpp_config = KVPPConfig.from_vllm_config(self.vllm_config)
+        if kvpp_config.size > 1:
+            kvpp_rank = get_tp_group().rank_in_group % kvpp_config.size
+            self._kvpp_cache_allocation_plan = create_kvpp_cache_allocation_plan(
+                self.vllm_config,
+                kv_cache_spec,
+                kvpp_rank,
             )
         if get_ascend_config().sparse_kv_offload_config.enabled:
             # reserve kv_cache_spec for sparse kv offload memory profile usage.
