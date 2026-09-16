@@ -87,6 +87,15 @@ env_variables: dict[str, Callable[[], Any]] = {
     # (safe for Ascend 910B/A3). Set to a positive value to override when
     # auto-detection is unavailable or for debugging UB overflow issues.
     "VLLM_ASCEND_ROPE_UB_SIZE_KB": lambda: int(os.getenv("VLLM_ASCEND_ROPE_UB_SIZE_KB") or 0),
+    # Emit per-phase wall-clock timing for the DFlash propose path (prepare
+    # inputs, context KV prewrite, metadata build, graph replay/eager forward).
+    # Timing inserts torch.npu.synchronize calls; use for diagnosis only.
+    # Default: 0 (disabled). Valid values: 0 or 1. Not sensitive.
+    "VLLM_ASCEND_DFLASH_PHASE_TIMING": lambda: _strict_binary_env("VLLM_ASCEND_DFLASH_PHASE_TIMING"),
+    # Number of propose steps between DFlash phase-timing log lines.
+    "VLLM_ASCEND_DFLASH_PHASE_TIMING_INTERVAL": lambda: int(
+        os.getenv("VLLM_ASCEND_DFLASH_PHASE_TIMING_INTERVAL") or 50
+    ),
 }
 
 # end-env-vars-definition

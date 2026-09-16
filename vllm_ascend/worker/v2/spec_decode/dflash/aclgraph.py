@@ -88,7 +88,13 @@ class DFlashAclGraphManager(DFlashCudaGraphManager):
             self.speculator.input_batch.seq_lens_cpu_upper_bound,
         )
         self.update_stream.wait_stream(torch.npu.current_stream())
-        ret = super().run_fullgraph(desc)
+        timer = getattr(self.speculator, "_phase_timer", None)
+        if timer is not None and not torch.npu.is_current_stream_capturing():
+            with timer.phase("graph_replay"):
+                ret = super().run_fullgraph(desc)
+            timer.full_graph_steps += 1
+        else:
+            ret = super().run_fullgraph(desc)
 
         # refer to vllm.v1.worker.gpu.dp_utils.sync_cudagraph_and_dp_padding to
         # calculate num_tokens_across_dp.

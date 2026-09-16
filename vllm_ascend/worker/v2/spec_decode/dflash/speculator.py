@@ -18,6 +18,10 @@ from vllm.v1.worker.gpu.spec_decode.dflash.speculator import (
 
 from vllm_ascend.utils import vllm_version_is
 from vllm_ascend.worker.v2.attn_utils import build_attn_metadata_wrapper
+from vllm_ascend.worker.v2.spec_decode.dflash.phase_timing import (
+    DFlashPhaseTimer,
+    get_phase_timer,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +32,14 @@ class AscendDFlashSpeculator(DFlashSpeculator):
         # draft FULL graph. Keep only that call's result; a failed rebuild
         # must not leave an earlier result available for replay.
         self._current_propose_draft_metadata = None
-        metadata = super()._build_draft_attn_metadata(num_reqs, num_reqs_padded, num_tokens_padded, *args, **kwargs)
+        timer = self._phase_timer
+        if timer is None:
+            metadata = super()._build_draft_attn_metadata(num_reqs, num_reqs_padded, num_tokens_padded, *args, **kwargs)
+        else:
+            with timer.phase("metadata_build"):
+                metadata = super()._build_draft_attn_metadata(
+                    num_reqs, num_reqs_padded, num_tokens_padded, *args, **kwargs
+                )
         if getattr(self, "_reuse_draft_metadata_within_propose", False) and metadata is not None:
             self._current_propose_draft_metadata = (num_reqs, num_reqs_padded, num_tokens_padded, metadata)
         return metadata
@@ -90,6 +101,7 @@ class AscendDFlashSpeculator(DFlashSpeculator):
         super().__init__(vllm_config, device)
         self._reuse_draft_metadata_within_propose = False
         self._current_propose_draft_metadata = None
+        self._phase_timer: DFlashPhaseTimer | None = get_phase_timer()
 
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
         if self.speculative_config.enforce_eager:
@@ -100,6 +112,38 @@ class AscendDFlashSpeculator(DFlashSpeculator):
         # It needs this speculator to update full-graph params, so set it here.
         self.query_cudagraph_manager.speculator = self
         self.query_cudagraph_manager.update_stream = self.update_stream
+
+    def _instrument_context_kv(self) -> None:
+        """Wrap the draft model's context-KV prewrite with phase timing.
+
+        Runs eagerly outside the captured graph, so synchronizing here is
+        safe outside capture/dummy paths (guarded inside the wrapper).
+        """
+        if self._phase_timer is None or getattr(self, "_context_kv_instrumented", False):
+            return
+        original = self.model.precompute_and_store_context_kv
+        timer = self._phase_timer
+
+        def timed_precompute(*args, **kwargs):
+            if torch.npu.is_current_stream_capturing():
+                return original(*args, **kwargs)
+            with timer.phase("context_kv"):
+                return original(*args, **kwargs)
+
+        self.model.precompute_and_store_context_kv = timed_precompute
+        self._context_kv_instrumented = True
+
+    def _generate_draft(self, *args, **kwargs):
+        # Eager draft forward (also used during graph capture; the timer
+        # no-ops while capturing). A nonzero eager share at runtime means the
+        # draft is NOT replaying the FULL graph.
+        timer = self._phase_timer
+        if timer is None or torch.npu.is_current_stream_capturing():
+            return super()._generate_draft(*args, **kwargs)
+        with timer.phase("eager_forward"):
+            ret = super()._generate_draft(*args, **kwargs)
+        timer.eager_steps += 1
+        return ret
 
     def set_attn(
         self,
@@ -137,6 +181,8 @@ class AscendDFlashSpeculator(DFlashSpeculator):
                 attn_backends[layer_name] = attn_layers[layer_name].get_attn_backend()
 
         self.attn_backends = attn_backends
+        self._instrument_context_kv()
+        _instrument_prepare_inputs(self._phase_timer)
 
     def propose(
         self,
@@ -162,6 +208,7 @@ class AscendDFlashSpeculator(DFlashSpeculator):
         self.input_batch = input_batch
         self._current_propose_draft_metadata = None
         self._reuse_draft_metadata_within_propose = not dummy_run and not is_profile
+        timer = self._phase_timer if not dummy_run and not is_profile else None
         try:
             sync_state = num_tokens_across_dp if vllm_version_is("0.28.0") else dp_sync
             if dummy_run and skip_attn_for_dummy_run:
@@ -171,6 +218,8 @@ class AscendDFlashSpeculator(DFlashSpeculator):
                 # TODO: Remove this guard once main2main includes upstream vLLM
                 # #54856 (facd9a74a1), which resets the profiling DP counts.
                 sync_state = None
+            if timer is not None:
+                timer.begin_step()
             with build_attn_metadata_wrapper():
                 return super().propose(
                     input_batch,
@@ -195,6 +244,33 @@ class AscendDFlashSpeculator(DFlashSpeculator):
             # decode steps, even after an exception or an eager dispatch.
             self._reuse_draft_metadata_within_propose = False
             self._current_propose_draft_metadata = None
+            if timer is not None:
+                timer.end_step(len(self.draft_kv_cache_group_ids))
+
+
+def _instrument_prepare_inputs(timer: DFlashPhaseTimer | None) -> None:
+    """Wrap upstream ``prepare_dflash_inputs`` with phase timing (idempotent).
+
+    Upstream ``DFlashSpeculator.propose`` resolves the helper through its own
+    module namespace once per draft KV cache group, so the wrapper also
+    surfaces the per-group multiplication in the mixed configuration.
+    """
+    if timer is None:
+        return
+    from vllm.v1.worker.gpu.spec_decode.dflash import speculator as upstream_speculator
+
+    original = upstream_speculator.prepare_dflash_inputs
+    if getattr(original, "_ascend_phase_timed", False):
+        return
+
+    def timed_prepare(*args, **kwargs):
+        if torch.npu.is_current_stream_capturing():
+            return original(*args, **kwargs)
+        with timer.phase("prepare_inputs"):
+            return original(*args, **kwargs)
+
+    timed_prepare._ascend_phase_timed = True  # type: ignore[attr-defined]
+    upstream_speculator.prepare_dflash_inputs = timed_prepare
 
 
 # main2main compat: upstream ``_prepare_dflash_inputs_kernel`` added four
