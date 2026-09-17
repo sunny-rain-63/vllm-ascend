@@ -231,10 +231,18 @@ if vllm_version_is("0.28.0"):
         last_valid_pos = tl.load(target_positions_ptr + valid_ctx_end - 1)
         query_base = req_idx * num_query_per_req
 
+        # Context and graph padding can contain thousands of entries. Tile
+        # these operations instead of issuing one scalar load/store per entry.
+        # Only program 0 owns each request, as in the scalar implementation.
+        lane_offsets = tl.arange(0, BLOCK_SIZE)
         # --- Context positions / slots ---
-        for j in range(0, num_ctx):
-            ctx_pos_idx = ctx_start + j
-            is_valid_ctx = j < num_valid_ctx
+        for j in range(0, num_ctx, BLOCK_SIZE):
+            ctx_pos_idx = ctx_start + j + lane_offsets
+            lane = j + lane_offsets
+            ctx_mask = lane < num_ctx
+            # Keep the scalar version's null-block guard: rejected-tail lanes
+            # and null block IDs must never produce a real cache slot.
+            is_valid_ctx = lane < num_valid_ctx
             ctx_pos = tl.load(target_positions_ptr + ctx_pos_idx, mask=is_valid_ctx, other=0)
             ctx_block_num = ctx_pos // block_size
             ctx_block_num = tl.minimum(ctx_block_num, block_table_stride - 1)
@@ -248,8 +256,8 @@ if vllm_version_is("0.28.0"):
                 ctx_block_id * block_size + (ctx_pos % block_size),
                 PAD_SLOT_ID,
             )
-            tl.store(out_context_positions_ptr + ctx_pos_idx, ctx_pos)
-            tl.store(out_context_slot_mapping_ptr + ctx_pos_idx, ctx_slot)
+            tl.store(out_context_positions_ptr + ctx_pos_idx, ctx_pos, mask=ctx_mask)
+            tl.store(out_context_slot_mapping_ptr + ctx_pos_idx, ctx_slot, mask=ctx_mask)
 
         # --- Query positions / input_ids / slots ---
         for q_off in range(0, num_query_per_req):
@@ -299,25 +307,28 @@ if vllm_version_is("0.28.0"):
         if req_idx == num_reqs - 1:
             # Pad per-request buffers to max_num_reqs for CUDA graph safety.
             last_query_end = num_reqs * num_query_per_req
-            for i in range(num_reqs, max_num_reqs + 1):
-                tl.store(out_query_start_loc_ptr + i, last_query_end)
-            for i in range(num_reqs, max_num_reqs):
-                tl.store(out_seq_lens_ptr + i, 0)
+            for i in range(num_reqs, max_num_reqs + 1, BLOCK_SIZE):
+                pad_idx = i + lane_offsets
+                tl.store(out_query_start_loc_ptr + pad_idx, last_query_end, mask=pad_idx <= max_num_reqs)
+                tl.store(out_seq_lens_ptr + pad_idx, 0, mask=pad_idx < max_num_reqs)
             # Padded sample slots point at query index 0 (a valid row in
             # last_hidden_states) so CG replay never reads OOB. Padded sample
             # idx mappings point to -1, which is ignored during sampling.
             pad_start = num_reqs * num_speculative_steps
             pad_end = max_num_reqs * num_speculative_steps
-            for i in range(pad_start, pad_end):
-                tl.store(out_sample_indices_ptr + i, 0)
-                tl.store(out_sample_pos_ptr + i, 0)
-                tl.store(out_sample_idx_mapping_ptr + i, -1)
+            for i in range(pad_start, pad_end, BLOCK_SIZE):
+                pad_idx = i + lane_offsets
+                pad_mask = pad_idx < pad_end
+                tl.store(out_sample_indices_ptr + pad_idx, 0, mask=pad_mask)
+                tl.store(out_sample_pos_ptr + pad_idx, 0, mask=pad_mask)
+                tl.store(out_sample_idx_mapping_ptr + pad_idx, -1, mask=pad_mask)
             # Pad query slot mappings past num_query_tokens with PAD so the
             # captured CG sees PAD slots (no K/V write) for replay sizes
             # larger than the current request count.
             q_pad_start = num_reqs * num_query_per_req
-            for i in range(q_pad_start, max_num_tokens):
-                tl.store(out_query_slot_mapping_ptr + i, PAD_SLOT_ID)
+            for i in range(q_pad_start, max_num_tokens, BLOCK_SIZE):
+                pad_idx = i + lane_offsets
+                tl.store(out_query_slot_mapping_ptr + pad_idx, PAD_SLOT_ID, mask=pad_idx < max_num_tokens)
 else:
     # main2main compat: upstream ``_prepare_dflash_inputs_kernel`` added
     # ``cp_rank``/``CP_SIZE``/``CP_INTERLEAVE`` for DCP support (see
@@ -395,10 +406,18 @@ else:
         last_valid_pos = tl.load(target_positions_ptr + valid_ctx_end - 1)
         query_base = req_idx * num_query_per_req
 
+        # Context and graph padding can contain thousands of entries. Tile
+        # these operations instead of issuing one scalar load/store per entry.
+        # Only program 0 owns each request, as in the scalar implementation.
+        lane_offsets = tl.arange(0, BLOCK_SIZE)
         # --- Context positions / slots ---
-        for j in range(0, num_ctx):
-            ctx_pos_idx = ctx_start + j
-            is_valid_ctx = j < num_valid_ctx
+        for j in range(0, num_ctx, BLOCK_SIZE):
+            ctx_pos_idx = ctx_start + j + lane_offsets
+            lane = j + lane_offsets
+            ctx_mask = lane < num_ctx
+            # Keep the scalar version's null-block guard: rejected-tail lanes
+            # and null block IDs must never produce a real cache slot.
+            is_valid_ctx = lane < num_valid_ctx
             ctx_pos = tl.load(target_positions_ptr + ctx_pos_idx, mask=is_valid_ctx, other=0)
             ctx_block_num = ctx_pos // block_size
             ctx_block_num = tl.minimum(ctx_block_num, block_table_stride - 1)
@@ -412,8 +431,8 @@ else:
                 ctx_block_id * block_size + (ctx_pos % block_size),
                 PAD_SLOT_ID,
             )
-            tl.store(out_context_positions_ptr + ctx_pos_idx, ctx_pos)
-            tl.store(out_context_slot_mapping_ptr + ctx_pos_idx, ctx_slot)
+            tl.store(out_context_positions_ptr + ctx_pos_idx, ctx_pos, mask=ctx_mask)
+            tl.store(out_context_slot_mapping_ptr + ctx_pos_idx, ctx_slot, mask=ctx_mask)
 
         # --- Query positions / input_ids / slots ---
         for q_off in range(0, num_query_per_req):
@@ -463,22 +482,25 @@ else:
         if req_idx == num_reqs - 1:
             # Pad per-request buffers to max_num_reqs for CUDA graph safety.
             last_query_end = num_reqs * num_query_per_req
-            for i in range(num_reqs, max_num_reqs + 1):
-                tl.store(out_query_start_loc_ptr + i, last_query_end)
-            for i in range(num_reqs, max_num_reqs):
-                tl.store(out_seq_lens_ptr + i, 0)
+            for i in range(num_reqs, max_num_reqs + 1, BLOCK_SIZE):
+                pad_idx = i + lane_offsets
+                tl.store(out_query_start_loc_ptr + pad_idx, last_query_end, mask=pad_idx <= max_num_reqs)
+                tl.store(out_seq_lens_ptr + pad_idx, 0, mask=pad_idx < max_num_reqs)
             # Padded sample slots point at query index 0 (a valid row in
             # last_hidden_states) so CG replay never reads OOB. Padded sample
             # idx mappings point to -1, which is ignored during sampling.
             pad_start = num_reqs * num_speculative_steps
             pad_end = max_num_reqs * num_speculative_steps
-            for i in range(pad_start, pad_end):
-                tl.store(out_sample_indices_ptr + i, 0)
-                tl.store(out_sample_pos_ptr + i, 0)
-                tl.store(out_sample_idx_mapping_ptr + i, -1)
+            for i in range(pad_start, pad_end, BLOCK_SIZE):
+                pad_idx = i + lane_offsets
+                pad_mask = pad_idx < pad_end
+                tl.store(out_sample_indices_ptr + pad_idx, 0, mask=pad_mask)
+                tl.store(out_sample_pos_ptr + pad_idx, 0, mask=pad_mask)
+                tl.store(out_sample_idx_mapping_ptr + pad_idx, -1, mask=pad_mask)
             # Pad query slot mappings past num_query_tokens with PAD so the
             # captured CG sees PAD slots (no K/V write) for replay sizes
             # larger than the current request count.
             q_pad_start = num_reqs * num_query_per_req
-            for i in range(q_pad_start, max_num_tokens):
-                tl.store(out_query_slot_mapping_ptr + i, PAD_SLOT_ID)
+            for i in range(q_pad_start, max_num_tokens, BLOCK_SIZE):
+                pad_idx = i + lane_offsets
+                tl.store(out_query_slot_mapping_ptr + pad_idx, PAD_SLOT_ID, mask=pad_idx < max_num_tokens)
