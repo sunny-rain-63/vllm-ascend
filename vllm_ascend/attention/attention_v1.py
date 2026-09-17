@@ -48,6 +48,7 @@ from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
+    ExactSeqLensListCache,
     PagedAttentionGraphParam,
     cache_graph_workspace,
     enable_dcp,
@@ -310,6 +311,27 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         """
         return {}
 
+    def _get_seq_lens_list(
+        self,
+        common_attn_metadata: AscendCommonAttentionMetadata,
+        seq_lens: torch.Tensor,
+    ) -> list[int]:
+        seq_lens_list_cache = common_attn_metadata.exact_seq_lens_list_cache
+        if (
+            isinstance(seq_lens_list_cache, ExactSeqLensListCache)
+            and type(self) is AscendAttentionMetadataBuilder
+            and self.vllm_config.use_v2_model_runner
+            and self.speculative_config is not None
+            and self.speculative_config.parallel_drafting
+            and not self.pcp_enabled
+            and not isinstance(self.kv_cache_spec, CrossAttentionSpec)
+        ):
+            # Parallel drafting requires exact device lengths after rejection.
+            # V2 groups in this build share the same immutable source tensor;
+            # convert it once instead of synchronizing once for every group.
+            return seq_lens_list_cache.get_list(seq_lens)
+        return seq_lens.tolist()
+
     def build(
         self,
         common_prefix_len: int,
@@ -353,7 +375,7 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         query_start_loc = query_start_loc_cpu.pin_memory().to(self.device, non_blocking=True)
 
         actual_seq_lengths_q = query_start_loc_cpu[1:].tolist()
-        seq_lens_list = seq_lens.tolist()
+        seq_lens_list = self._get_seq_lens_list(common_attn_metadata, seq_lens)
         # Sequence-parallel (or cudagraph) padding makes the model runner insert a
         # dummy padding request into query_start_loc to satisfy the FIA TND-layout
         # constraint (sum of q lengths == hidden_states.shape[0]), bumping the

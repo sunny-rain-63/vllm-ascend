@@ -314,6 +314,21 @@
 #    Future Plan:
 #       Remove the FIA bound after the underlying operator is fixed and tested
 #       above the boundary. Keep shared-plane layout validation for this backend.
+#   3. `vllm.v1.core.kv_cache_utils.get_kv_cache_groups`
+#      `vllm.v1.core.kv_cache_utils._annotate_eagle_groups` (when present)
+#    Why:
+#       DFlash draft layer names do not carry the upstream spec marker. Mixed
+#       Full/SWA can produce singleton groups, leaving safe memory unused once
+#       the FIA per-plane bound is reached and misclassifying target Mamba as
+#       draft state for prefix-cache lookup.
+#    How:
+#       Carry the loaded speculator's explicit draft names through the spec RPC.
+#       Annotate ownership before projection/warnings. Re-plan with wider groups
+#       only when exact-spec/role grouping improves budget-bounded admission
+#       capacity; retain physical layout, memory and FIA limits.
+#    Future Plan:
+#       Replace with upstream draft-identity and backend-aware grouping hooks
+#       when available. No upstream PR yet; this is an Ascend layout workaround.
 #
 # ** 10. File: platform/patch_mamba_block_aligned_split.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
