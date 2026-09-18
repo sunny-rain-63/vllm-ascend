@@ -26,6 +26,7 @@ from vllm.v1.kv_cache_interface import (
     get_kv_cache_spec_kind,
 )
 
+from vllm_ascend import envs
 from vllm_ascend.core.kv_cache_interface import is_prefix_cacheable
 from vllm_ascend.models.glm5next.cache_config import (
     _get_glm5_next_cache_layout,
@@ -41,7 +42,6 @@ _KIMI_K3_TARGET_LAYER_PREFIX = "language_model.model.layers."
 _KIMI_K3_DRAFT_LAYER_PREFIX = "model.layers."
 # Conservative diagnostic workaround: 4096 physical blocks passed the reported
 # Qwen TP2 runs. Also bound other geometries below the reproduced FIA boundary.
-_DFLASH_MAX_PHYSICAL_BLOCKS = 4096
 _DFLASH_KERNEL_BLOCK_SIZE = 128
 _DFLASH_MAX_KERNEL_BLOCKS = 1 << 16
 _DFLASH_MAX_PLANE_ELEMENTS = 1 << 32
@@ -623,7 +623,10 @@ def _limit_mixed_dflash_cache_blocks(original_planner):
         ):
             return configs
 
-        limits = [_DFLASH_MAX_PHYSICAL_BLOCKS]
+        requested_cap = envs.VLLM_ASCEND_DFLASH_FIA_MAX_BLOCKS
+        if requested_cap < 0 or requested_cap == 1:
+            raise ValueError("VLLM_ASCEND_DFLASH_FIA_MAX_BLOCKS must be 0 or >= 2.")
+        limits: list[int] = [requested_cap] if requested_cap else []
         for config, budget in zip(configs, available_memory):
             if not config.kv_cache_groups:
                 continue
@@ -646,6 +649,13 @@ def _limit_mixed_dflash_cache_blocks(original_planner):
                         )
                     )
         safe_blocks = min(limits)
+        logger.info(
+            "DFlash FIA capacity: requested_cap=%d (0=calculated), planned_blocks=%s, effective_blocks=%d. "
+            "Calculated address bounds are not a substitute for NPU validation.",
+            requested_cap,
+            [config.num_blocks for config in configs],
+            safe_blocks,
+        )
         if safe_blocks < 2:
             raise ValueError("Insufficient memory/address space for mixed DFlash cache blocks.")
         if not any(config.num_blocks > safe_blocks for config in configs):

@@ -36,6 +36,11 @@ def _strict_binary_env(name: str, default: str = "0") -> bool:
 
 
 env_variables: dict[str, Callable[[], Any]] = {
+    # Experimental mixed-DFlash FIA cache capacity. Default 4096 preserves
+    # the tested workaround; 0 uses calculated address/memory limits only.
+    # Other valid values are integers >= 2. Values > 4096 require NPU address
+    # and accuracy validation. Startup-only, not sensitive.
+    "VLLM_ASCEND_DFLASH_FIA_MAX_BLOCKS": lambda: int(os.getenv("VLLM_ASCEND_DFLASH_FIA_MAX_BLOCKS", "4096")),
     # max compile thread number for package building. Usually, it is set to
     # the number of CPU cores. If not set, the default value is None, which
     # means all number of CPU cores will be used.

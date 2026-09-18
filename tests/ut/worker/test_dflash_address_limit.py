@@ -43,6 +43,7 @@ class TestDFlashAddressLimit(unittest.TestCase):
             )
         ]
         namespace = dict(
+            envs=SimpleNamespace(VLLM_ASCEND_DFLASH_FIA_MAX_BLOCKS=4096),
             copy=copy,
             wraps=wraps,
             logger=Mock(),
@@ -51,6 +52,7 @@ class TestDFlashAddressLimit(unittest.TestCase):
             MambaSpec=_MambaSpec,
         )
         exec(compile(tree, str(path), "exec"), namespace)
+        self.envs = namespace["envs"]
         self.wrap = namespace["_limit_mixed_dflash_cache_blocks"]
         self.config = SimpleNamespace(
             use_v2_model_runner=True,
@@ -97,6 +99,51 @@ class TestDFlashAddressLimit(unittest.TestCase):
         self.assertEqual(self.calls[-1].cache_config.num_gpu_blocks_override, 4096)
         self.assertIsNone(self.config.cache_config.num_gpu_blocks_override)
         self.assertEqual(result.kv_cache_groups, ["unchanged groups"])
+
+    def test_compare_capacity_policies(self):
+        for cap, expected in ((4096, 4096), (4608, 4608), (5120, 5120), (0, 5461), (8192, 5461)):
+            with self.subTest(cap=cap):
+                self.envs.VLLM_ASCEND_DFLASH_FIA_MAX_BLOCKS = cap
+                result = self._run()[0]
+                self.assertEqual(result.num_blocks, expected)
+                self.assertEqual(result.kv_cache_tensors[0].size, expected * self.page)
+                self.assertIsNone(self.config.cache_config.num_gpu_blocks_override)
+
+    def test_calculated_mode_retains_budget_and_user_override(self):
+        self.envs.VLLM_ASCEND_DFLASH_FIA_MAX_BLOCKS = 0
+        self.assertEqual(self._run([3000 * self.page])[0].num_blocks, 3000)
+        self.config.cache_config.num_gpu_blocks_override = 4096
+        self.assertEqual(self._run()[0].num_blocks, 4096)
+
+    def test_calculated_mode_respects_rank_budgets(self):
+        self.envs.VLLM_ASCEND_DFLASH_FIA_MAX_BLOCKS = 0
+        self.assertEqual([p.num_blocks for p in self._run([9000 * self.page, 5000 * self.page])], [5000, 5000])
+
+    def test_calculated_mode_respects_legacy_memory_budget(self):
+        self.envs.VLLM_ASCEND_DFLASH_FIA_MAX_BLOCKS = 0
+        self.legacy = True
+        self.assertEqual(self._run([10000 * self.page])[0].num_blocks, 5000)
+
+    def test_calculated_bounds_across_geometries(self):
+        self.envs.VLLM_ASCEND_DFLASH_FIA_MAX_BLOCKS = 0
+        for block_size in (128, 512, 1536, 3072):
+            for heads in (1, 4, 8):
+                for head_size_v in (128, 256, 1024):
+                    with self.subTest(block_size=block_size, heads=heads, head_size_v=head_size_v):
+                        self.specs["full"] = _FullSpec(block_size, heads, 128, head_size_v)
+                        self.specs["swa"] = _SlidingSpec(128, heads, 128, head_size_v)
+                        count = self._run()[0].num_blocks
+                        for spec in (self.specs["full"], self.specs["swa"]):
+                            self.assertLess(count * (spec.block_size // 128) - 1, 65536)
+                            plane_size = spec.block_size * spec.num_kv_heads * max(spec.head_size, spec.head_size_v)
+                            self.assertLess(count * plane_size - 1, 2**32)
+                        self.assertLessEqual(count * self.page, 9000 * self.page)
+
+    def test_invalid_caps_are_rejected(self):
+        for cap in (-1, 1):
+            self.envs.VLLM_ASCEND_DFLASH_FIA_MAX_BLOCKS = cap
+            with self.assertRaisesRegex(ValueError, "must be 0 or >= 2"):
+                self._run()
 
     def test_small_budget_is_not_increased_to_4096(self):
         self.assertEqual(self._run([2000 * self.page])[0].num_blocks, 2000)
