@@ -37,6 +37,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     MambaSpec,
     MLAAttentionSpec,
+    SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
@@ -194,6 +195,21 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
             continue
 
     if mamba_specs:
+        speculative = getattr(vllm_config, "speculative_config", None)
+        draft_config = getattr(getattr(speculative, "draft_model_config", None), "hf_config", None)
+        draft_layer_types = getattr(draft_config, "layer_types", None) or ()
+        align_dflash_blocks = (
+            getattr(speculative, "method", None) == "dflash"
+            and "sliding_attention" in draft_layer_types
+            and "full_attention" in draft_layer_types
+        )
+        if align_dflash_blocks:
+            for layer_name in attention_layer_names:
+                spec = kv_cache_spec[layer_name]
+                if type(spec) is SlidingWindowSpec:
+                    # Match FullAttention's storage block (1536 for Qwen TP2).
+                    # The kernel block and sliding window remain unchanged.
+                    kv_cache_spec[layer_name] = replace(spec, block_size=vllm_config.cache_config.block_size)
         common_page_size = max(spec.page_size_bytes for spec in (*kv_cache_spec.values(), *mamba_specs.values()))
         for layer_name in attention_layer_names:
             spec = kv_cache_spec[layer_name]
