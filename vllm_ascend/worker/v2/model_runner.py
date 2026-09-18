@@ -61,7 +61,11 @@ from vllm_ascend.ops.rotary_embedding import set_cos_and_sin, update_cos_sin
 from vllm_ascend.utils import lmhead_tp_enable, set_potential_max_tokens, vllm_version_is
 from vllm_ascend.worker.utils import disable_compilation
 from vllm_ascend.worker.v2.aclgraph_utils import ModelAclGraphManager
-from vllm_ascend.worker.v2.attn_utils import build_attn_state, unwrap_mamba_kv_cache_groups
+from vllm_ascend.worker.v2.attn_utils import (
+    build_attn_state,
+    flatten_runner_kv_caches,
+    unwrap_mamba_kv_cache_groups,
+)
 from vllm_ascend.worker.v2.eplb import AscendEPLBController
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
 from vllm_ascend.worker.v2.kvpp import KVPPRuntime
@@ -259,6 +263,9 @@ class NPUModelRunner(GPUModelRunner):
                 self.model_state.pcp_manager = self.pcp_manager
                 if self.speculator is not None:
                     self.speculator.pcp_manager = self.pcp_manager
+
+        # Upstream copy-on-write expects individual tensors, not layer tuples.
+        self.kv_caches = flatten_runner_kv_caches(self.kv_caches)
 
         # Only target-model layers determine whether FIA is in use. This flag
         # is used for adaptive verification handling.

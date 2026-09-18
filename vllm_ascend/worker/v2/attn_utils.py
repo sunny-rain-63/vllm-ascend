@@ -1224,6 +1224,22 @@ def _reshape_kv_cache_v2(
     return kv_caches
 
 
+def flatten_runner_kv_caches(kv_caches: list[Any]) -> list[torch.Tensor]:
+    """Expose individual tensors to upstream's cache-block copy helper.
+
+    Ascend layer caches can be tuples/lists of K/V or Mamba state tensors.
+    Only the runner's copy list is flattened; bound layer views and their
+    underlying storage remain unchanged.
+    """
+    flattened: list[torch.Tensor] = []
+    for cache in kv_caches:
+        if isinstance(cache, torch.Tensor):
+            flattened.append(cache)
+        else:
+            flattened.extend(cache)
+    return flattened
+
+
 _BUILD_ATTN_METADATA_MODULE = vllm.v1.worker.gpu.spec_decode.speculator
 
 
