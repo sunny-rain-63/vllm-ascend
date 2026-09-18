@@ -1226,6 +1226,28 @@ def _reshape_kv_cache_v2(
     return kv_caches
 
 
+def flatten_runner_kv_caches(kv_caches: list[Any]) -> list[torch.Tensor]:
+    """Flatten per-layer cache tuples/lists into individual tensors.
+
+    Ascend binds several layer caches as tuples — full-attention ``(k, v)``
+    pairs, SFA indexer ``(k, scale)`` pairs and Mamba state tuples — so the
+    runner's ``kv_caches`` list can hold non-tensor entries. Upstream vLLM
+    passes that list straight to ``copy_kv_cache_blocks_inplace`` on
+    copy-on-write events (preemption / partial prefix-cache hits), which
+    calls ``cache.device`` on every entry and crashes with
+    ``AttributeError: 'list' object has no attribute 'device'``. Its only
+    other consumer is teardown clearing, so flattening is safe; duplicate
+    views of one allocation are deduplicated by the copy helper itself.
+    """
+    flattened: list[torch.Tensor] = []
+    for cache in kv_caches:
+        if isinstance(cache, torch.Tensor):
+            flattened.append(cache)
+        else:
+            flattened.extend(cache)
+    return flattened
+
+
 _BUILD_ATTN_METADATA_MODULE = vllm.v1.worker.gpu.spec_decode.speculator
 
 
