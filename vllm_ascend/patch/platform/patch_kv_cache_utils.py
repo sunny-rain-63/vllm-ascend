@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Ascend project
+import copy
 import math
 from collections import defaultdict
 from dataclasses import replace
+from functools import wraps
 
 import vllm.v1.core.kv_cache_utils
 from vllm.config import VllmConfig
@@ -19,6 +21,7 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     MLAAttentionSpec,
     SlidingWindowMLASpec,
+    SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
     get_kv_cache_spec_kind,
 )
@@ -36,6 +39,12 @@ from vllm_ascend.utils import vllm_version_is
 
 _KIMI_K3_TARGET_LAYER_PREFIX = "language_model.model.layers."
 _KIMI_K3_DRAFT_LAYER_PREFIX = "model.layers."
+# Conservative diagnostic workaround: 4096 physical blocks passed the reported
+# Qwen TP2 runs. Also bound other geometries below the reproduced FIA boundary.
+_DFLASH_MAX_PHYSICAL_BLOCKS = 4096
+_DFLASH_KERNEL_BLOCK_SIZE = 128
+_DFLASH_MAX_KERNEL_BLOCKS = 1 << 16
+_DFLASH_MAX_PLANE_ELEMENTS = 1 << 32
 _orig_resolve_kv_cache_block_sizes = vllm.v1.core.kv_cache_utils.resolve_kv_cache_block_sizes
 _orig_get_kv_cache_groups_uniform_page_size = vllm.v1.core.kv_cache_utils._get_kv_cache_groups_uniform_page_size
 _orig_get_kv_cache_groups = vllm.v1.core.kv_cache_utils.get_kv_cache_groups
@@ -598,6 +607,68 @@ def _get_glm5_next_kv_cache_groups(
     return _orig_get_kv_cache_groups(vllm_config, kv_cache_spec)
 
 
+def _limit_mixed_dflash_cache_blocks(original_planner):
+    @wraps(original_planner)
+    def plan(vllm_config, kv_cache_specs, available_memory):
+        configs = original_planner(vllm_config, kv_cache_specs, available_memory)
+        speculative = getattr(vllm_config, "speculative_config", None)
+        draft_config = getattr(getattr(speculative, "draft_model_config", None), "hf_config", None)
+        layer_types = getattr(draft_config, "layer_types", None) or ()
+        if not (
+            getattr(vllm_config, "use_v2_model_runner", False)
+            and getattr(speculative, "method", None) == "dflash"
+            and "sliding_attention" in layer_types
+            and "full_attention" in layer_types
+            and any(isinstance(spec, MambaSpec) for specs in kv_cache_specs for spec in specs.values())
+        ):
+            return configs
+
+        limits = [_DFLASH_MAX_PHYSICAL_BLOCKS]
+        for config, budget in zip(configs, available_memory):
+            if not config.kv_cache_groups:
+                continue
+            # main descriptors overlay one backing; release descriptors own
+            # separate buffers. Never increase a small profiled allocation.
+            tensors = config.kv_cache_tensors
+            pool_bytes = tensors[0].size if hasattr(tensors[0], "layers") else sum(t.size for t in tensors)
+            bytes_per_block = pool_bytes // config.num_blocks
+            limits.extend((config.num_blocks, budget // bytes_per_block))
+        for specs in kv_cache_specs:
+            for spec in specs.values():
+                if type(spec) in (FullAttentionSpec, SlidingWindowSpec):
+                    if spec.block_size % _DFLASH_KERNEL_BLOCK_SIZE:
+                        raise ValueError("Mixed DFlash storage blocks must be divisible by the FIA kernel block size.")
+                    limits.extend(
+                        (
+                            _DFLASH_MAX_KERNEL_BLOCKS // (spec.block_size // _DFLASH_KERNEL_BLOCK_SIZE),
+                            _DFLASH_MAX_PLANE_ELEMENTS
+                            // (spec.block_size * spec.num_kv_heads * max(spec.head_size, spec.head_size_v)),
+                        )
+                    )
+        safe_blocks = min(limits)
+        if safe_blocks < 2:
+            raise ValueError("Insufficient memory/address space for mixed DFlash cache blocks.")
+        if not any(config.num_blocks > safe_blocks for config in configs):
+            return configs
+        safe_config = copy.copy(vllm_config)
+        safe_config.cache_config = copy.copy(vllm_config.cache_config)
+        safe_config.cache_config.num_gpu_blocks_override = safe_blocks
+        logger.warning(
+            "DFlash mixed cache address guard: physical_blocks=%d -> %d; "
+            "replanning before allocation (conservative FIA workaround).",
+            max(config.num_blocks for config in configs),
+            safe_blocks,
+        )
+        # Rebuild admission checks, descriptors and strides together, rather
+        # than truncating an already allocated tensor or only its block table.
+        replanned = original_planner(safe_config, kv_cache_specs, available_memory)
+        if len(replanned) != len(configs) or any(config.num_blocks > safe_blocks for config in replanned):
+            raise ValueError("Mixed DFlash cache planner did not preserve the address limit.")
+        return replanned
+
+    return plan
+
+
 def _ascend_get_kv_cache_config_from_groups(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
@@ -648,3 +719,8 @@ if not vllm_version_is("0.28.0"):
 import vllm.v1.engine.core  # noqa: E402
 
 vllm.v1.engine.core.resolve_kv_cache_block_sizes = _ascend_resolve_kv_cache_block_sizes
+
+vllm.v1.core.kv_cache_utils.get_kv_cache_configs = _limit_mixed_dflash_cache_blocks(
+    vllm.v1.core.kv_cache_utils.get_kv_cache_configs
+)
+vllm.v1.engine.core.get_kv_cache_configs = vllm.v1.core.kv_cache_utils.get_kv_cache_configs

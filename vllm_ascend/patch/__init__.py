@@ -267,6 +267,20 @@
 #    Future Plan:
 #       Remove this patch once upstream vLLM supports hybrid KV cache + CP for
 #       non-CUDA backends, or exposes a platform hook for this behavior.
+#   2. `vllm.v1.core.kv_cache_utils.get_kv_cache_configs`
+#      `vllm.v1.engine.core.get_kv_cache_configs`
+#    Why:
+#       Mixed DFlash still reaches the reproduced FIA high-address boundary
+#       after Full/SWA storage blocks are aligned. Reported Qwen TP2 tests
+#       avoided corruption with a 4096-block override.
+#    How:
+#       Re-plan before allocation with a conservative 4096-block cap, further
+#       bounded by real memory, kernel-block and plane-element address limits.
+#       Preserve smaller plans/overrides and leave other model paths unchanged.
+#       This does not alter grouping, masks, sampling or cache write paths.
+#    Future Plan:
+#       Remove after the FIA boundary is fixed and validated on hardware.
+#       No upstream PR: this is a scoped Ascend operator workaround.
 #
 # ** 10. File: platform/patch_mamba_block_aligned_split.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
