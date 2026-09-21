@@ -40,8 +40,10 @@ from vllm.v1.attention.backends.registry import (  # type: ignore
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import AttentionSpec, CrossAttentionSpec
 
+from vllm_ascend import envs
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
+from vllm_ascend.attention.fia_small_ops import small_ops_fused_infer_attention
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
     enable_dcp,
@@ -836,6 +838,11 @@ class AscendAttentionBackendImpl(AttentionImpl):
         # runner v2, there is not capturing attribute in forward_context,
         # just use getattr to avoid attribute error.
         if _EXTRA_CTX.capturing:
+            if envs.VLLM_ASCEND_FIA_SMALL_OPS:
+                raise RuntimeError(
+                    "VLLM_ASCEND_FIA_SMALL_OPS runs a per-request Python loop and "
+                    "cannot be captured into an ACL graph; run with enforce_eager=True."
+                )
             if self.sinks is not None:
                 attn_output, num_tokens = self.full_graph_fia_v2(query, key, value, attn_metadata, output)
                 output[:num_tokens] = attn_output[:num_tokens]
@@ -856,6 +863,13 @@ class AscendAttentionBackendImpl(AttentionImpl):
         ):
             key = key[:num_tokens]
             value = value[:num_tokens]
+        if envs.VLLM_ASCEND_FIA_SMALL_OPS:
+            attn_output = self._forward_fia_small_ops(
+                query, key, value, block_size, block_table, actual_seq_lengths_kv, attn_metadata
+            )
+            attn_output = attn_output.view(num_tokens, self.num_heads, self.head_size)
+            output[:num_tokens] = attn_output[:num_tokens]
+            return output
         # Get workspace from cache or calculate it if not present.
         if self.sinks is not None:
             actual_seq_qlen = attn_metadata.actual_seq_lengths_q
@@ -964,6 +978,66 @@ class AscendAttentionBackendImpl(AttentionImpl):
             attn_output = attn_output.view(num_tokens, self.num_heads, self.head_size)
         output[:num_tokens] = attn_output[:num_tokens]
         return output
+
+    def _forward_fia_small_ops(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        block_size: int,
+        block_table,
+        actual_seq_lengths_kv,
+        attn_metadata: AscendMetadata,
+    ) -> torch.Tensor:
+        """Debug fallback (VLLM_ASCEND_FIA_SMALL_OPS): replace the FIA fused
+        kernel with the small-ops reference. Correctness-oriented (per-request
+        loop, fp32 accumulation); bypasses the FIA uint32 element-offset
+        overflow on large KV caches. Not for production use."""
+        if self.use_bnsd_kv_cache:
+            raise RuntimeError(
+                "VLLM_ASCEND_FIA_SMALL_OPS does not support the BNSD KV cache layout"
+            )
+        if not attn_metadata.causal:
+            sparse_mode, pre_tokens = 0, None
+        elif self.sliding_window is not None:
+            sparse_mode, pre_tokens = 4, self.sliding_window
+        else:
+            sparse_mode, pre_tokens = 3, None
+
+        if block_table is not None:
+            # FIA consumes the paged cache as (num_blocks, block_size, N_kv * D)
+            # (see _get_kv_cache_view); the small-ops reference needs 4D.
+            num_blocks = key.shape[0]
+            key = key.view(num_blocks, block_size, self.num_kv_heads, self.head_size)
+            value = value.view(num_blocks, block_size, self.num_kv_heads, self.head_size)
+            kv_lens = actual_seq_lengths_kv
+        else:
+            # PrefillNoCache: _get_fia_params passes a cumsum here, while the
+            # reference expects per-request kv lengths.
+            cumsum = [int(v) for v in actual_seq_lengths_kv]
+            kv_lens = [cumsum[0]] + [b - a for a, b in zip(cumsum, cumsum[1:])]
+
+        actual_seq_qlen = attn_metadata.actual_seq_lengths_q
+        if self.sinks is not None and attn_metadata.attn_state == AscendAttentionState.DecodeOnly:
+            actual_seq_qlen = torch.tensor(
+                [1] * len(attn_metadata.seq_lens_list), dtype=torch.int32).cumsum(dim=0)
+
+        attn_output, _ = small_ops_fused_infer_attention(
+            query,
+            key,
+            value,
+            num_heads=self.num_heads,
+            num_key_value_heads=self.num_kv_heads,
+            block_table=block_table,
+            block_size=block_size,
+            actual_seq_qlen=actual_seq_qlen,
+            actual_seq_kvlen=kv_lens,
+            scale=self.scale,
+            sparse_mode=sparse_mode,
+            pre_tokens=pre_tokens,
+            learnable_sink=self.sinks,
+        )
+        return attn_output
 
     def _forward_fia_chunked_prefill_split(
         self,

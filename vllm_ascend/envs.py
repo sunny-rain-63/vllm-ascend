@@ -87,6 +87,13 @@ env_variables: dict[str, Callable[[], Any]] = {
     # (safe for Ascend 910B/A3). Set to a positive value to override when
     # auto-detection is unavailable or for debugging UB overflow issues.
     "VLLM_ASCEND_ROPE_UB_SIZE_KB": lambda: int(os.getenv("VLLM_ASCEND_ROPE_UB_SIZE_KB") or 0),
+    # Replace the FIA fused attention kernel with a small-ops reference
+    # implementation (gather/matmul/softmax, fp32 accumulation) in
+    # AscendAttentionBackend. Debug fallback for the FIA high-address overflow
+    # (element offsets >= 2**32 read wrong KV blocks). Requires eager execution
+    # (enforce_eager=True); not capture-friendly and not for production use.
+    # Valid values: 0 (default, use FIA) or 1. Not sensitive.
+    "VLLM_ASCEND_FIA_SMALL_OPS": lambda: _strict_binary_env("VLLM_ASCEND_FIA_SMALL_OPS"),
 }
 
 # end-env-vars-definition
