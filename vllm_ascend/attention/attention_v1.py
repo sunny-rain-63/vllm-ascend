@@ -23,6 +23,7 @@ import torch
 import torch_npu
 import vllm.envs as envs_vllm
 from vllm.config import VllmConfig, get_current_vllm_config
+from vllm.logger import logger
 from vllm.distributed import get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backend import (  # type: ignore
@@ -68,6 +69,9 @@ else:
 
 # default max value of sliding window size
 SWA_INT_MAX = 2147483647
+# bf16 FIA output vs fp32 small-ops reference: normal rounding stays under
+# ~2e-3; anything above this threshold indicates real divergence
+_FIA_SHADOW_DIFF_TOLERANCE = 5e-2
 _FIA_WORKSPACE_KEY = "npu_fused_infer_attention_score.workspace"
 _FIA_V2_WORKSPACE_KEY = "npu_fused_infer_attention_score_v2.workspace"
 _PA_WORKSPACE_KEY = "npu_paged_attention.workspace"
@@ -976,6 +980,9 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 )
 
             attn_output = attn_output.view(num_tokens, self.num_heads, self.head_size)
+        if envs.VLLM_ASCEND_FIA_SHADOW:
+            self._shadow_check_fia(query, key, value, block_size, block_table,
+                                   actual_seq_lengths_kv, attn_metadata, attn_output, num_tokens)
         output[:num_tokens] = attn_output[:num_tokens]
         return output
 
@@ -1038,6 +1045,52 @@ class AscendAttentionBackendImpl(AttentionImpl):
             learnable_sink=self.sinks,
         )
         return attn_output
+
+    def _shadow_check_fia(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        block_size: int,
+        block_table,
+        actual_seq_lengths_kv,
+        attn_metadata: AscendMetadata,
+        attn_output: torch.Tensor,
+        num_tokens,
+    ) -> None:
+        """VLLM_ASCEND_FIA_SHADOW: replay the same inputs with the small-ops
+        reference and compare against the FIA result. On divergence, log the
+        block-table/cache-view facts needed for offline replay. The FIA result
+        is always used downstream; this check only observes. Never raises."""
+        num_tokens = int(num_tokens)
+        try:
+            ref_output = self._forward_fia_small_ops(
+                query, key, value, block_size, block_table, actual_seq_lengths_kv, attn_metadata
+            )
+            diff = (
+                attn_output[:num_tokens].reshape(num_tokens, -1).float()
+                - ref_output.reshape(num_tokens, -1).float()
+            ).abs().max().item()
+            if diff <= _FIA_SHADOW_DIFF_TOLERANCE:
+                return
+            bt_stats = (
+                f"shape={tuple(block_table.shape)} max_id={int(block_table.max())} "
+                f"dtype={block_table.dtype}"
+            ) if isinstance(block_table, torch.Tensor) else "None"
+            view_stats = (
+                f"key shape={tuple(key.shape)} stride={tuple(key.stride())} "
+                f"contiguous={key.is_contiguous()} storage_offset={key.storage_offset()} "
+                f"dtype={key.dtype}"
+            )
+            logger.warning(
+                "FIA shadow divergence: diff=%.4e attn_state=%s num_tokens=%d "
+                "block_table=[%s] kv_lens=%s cache_view=[%s]. "
+                "FIA output was used; investigate with the dumped facts.",
+                diff, attn_metadata.attn_state, num_tokens, bt_stats,
+                list(actual_seq_lengths_kv)[:16], view_stats,
+            )
+        except Exception:
+            logger.exception("FIA shadow check itself failed (ignored)")
 
     def _forward_fia_chunked_prefill_split(
         self,

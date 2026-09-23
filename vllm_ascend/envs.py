@@ -94,6 +94,13 @@ env_variables: dict[str, Callable[[], Any]] = {
     # (enforce_eager=True); not capture-friendly and not for production use.
     # Valid values: 0 (default, use FIA) or 1. Not sensitive.
     "VLLM_ASCEND_FIA_SMALL_OPS": lambda: _strict_binary_env("VLLM_ASCEND_FIA_SMALL_OPS"),
+    # Shadow-check the FIA fused kernel against the small-ops reference on live
+    # traffic: FIA results are used as usual, while the same inputs are also
+    # evaluated with the small-ops path and compared per layer per step.
+    # Divergence details (block table stats, cache view layout) are logged and
+    # dumped for offline replay. Debug only; roughly doubles attention cost.
+    # Requires eager execution. Valid values: 0 (default) or 1. Not sensitive.
+    "VLLM_ASCEND_FIA_SHADOW": lambda: _strict_binary_env("VLLM_ASCEND_FIA_SHADOW"),
 }
 
 # end-env-vars-definition
