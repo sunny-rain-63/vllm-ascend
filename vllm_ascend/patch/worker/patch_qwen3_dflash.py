@@ -4,16 +4,41 @@ from vllm.model_executor.models.qwen3_dflash import (
     DFlashQwen3ForCausalLM,
     DFlashQwen3Model,
 )
+from vllm.triton_utils import HAS_TRITON, triton
+
+if HAS_TRITON:
+    from vllm_ascend.ops.triton.rope import rope_forward_triton_siso
+
+
+def _ensure_ascend_dflash_buffers(self) -> None:
+    """Build the fused KV/RoPE buffers plus Ascend-specific derived tensors.
+
+    ``_build_fused_kv_buffers`` is idempotent and may already have run during
+    weight loading, so only the missing pieces are (re)built here.
+    """
+    if not hasattr(self, "_num_attn_layers"):
+        self._build_fused_kv_buffers()
+    if hasattr(self, "_rope_use_siso"):
+        return
+    L = self._num_attn_layers
+    hd = self._head_dim
+    # fp32 stacked per-layer K-norm weights [L, 1, 1, hd] so the grouped
+    # RMSNorm below is one broadcast multiply instead of L small launches.
+    self._k_norm_weights_f32 = self._k_norm_weights.float().view(L, 1, 1, hd).contiguous()
+    # cos_sin_cache is [max_position, rotary_dim].
+    self._rope_rotary_dim = self._rope_cos_sin_cache.shape[-1]
+    # rope_forward_triton_siso reads the sine half at pad_rope_dim // 2, so the
+    # cos_sin_cache path is only exact when rotary_dim is a power of two.
+    self._rope_use_siso = HAS_TRITON and self._rope_rotary_dim == triton.next_power_of_2(self._rope_rotary_dim)
 
 
 def precompute_and_store_context_kv(
     self,
     context_states: torch.Tensor,
     context_positions: torch.Tensor,
-    context_slot_mapping: torch.Tensor | None = None,
+    context_slot_mapping: torch.Tensor | list[torch.Tensor | None] | None = None,
 ) -> None:
-    if not hasattr(self, "_num_attn_layers"):
-        self._build_fused_kv_buffers()
+    _ensure_ascend_dflash_buffers(self)
 
     num_ctx = context_states.shape[0]
     L = self._num_attn_layers
@@ -31,19 +56,36 @@ def precompute_and_store_context_kv(
     all_k = all_kv[0]  # [L, num_ctx, nkv, hd], contiguous
     all_v = all_kv[1]  # [L, num_ctx, nkv, hd], contiguous
 
-    # --- Per-layer RMSNorm K (3D: [num_ctx, nkv, hd] per layer) ---
-    all_k_normed = torch.empty_like(all_k)
-    for i in range(L):
-        k_norm_layer = self.layers[i].self_attn.k_norm
-        all_k_normed[i] = k_norm_layer(all_k[i])
+    # --- Grouped RMSNorm K across all layers ---
+    # One vectorized pass over [L, num_ctx, nkv, hd] with the per-layer weights
+    # broadcast on the layer axis, instead of L separate small npu_rms_norm
+    # launches.  Numerics match RMSNorm: fp32 variance, scale, then weight.
+    k32 = all_k.float()
+    var = k32.pow(2).mean(-1, keepdim=True)
+    all_k_normed = (k32 * torch.rsqrt(var + self._rms_norm_eps) * self._k_norm_weights_f32).to(all_k.dtype)
 
     # --- Fused RoPE across all layers ---
-    # View as [L * num_ctx, kv] so RoPE sees one big batch (no copy).
-    # In-place RoPE: pass K as the "query" arg with key=None.
-    all_k_flat = all_k_normed.view(L * num_ctx, kv)
     positions_repeated = context_positions.repeat(L)
-    tmpv = all_k_flat.clone()
-    self.layers[0].self_attn.rotary_emb(positions_repeated, all_k_flat, tmpv)
+    if self._rope_use_siso:
+        # Single-tensor in-place RoPE: no dummy key and no full-tensor clone.
+        all_k_flat = all_k_normed.view(L * num_ctx, nkv, hd)
+        cos_sin_cache = self._rope_cos_sin_cache
+        if cos_sin_cache.dtype != all_k_flat.dtype:
+            cos_sin_cache = cos_sin_cache.to(dtype=all_k_flat.dtype)
+        rope_forward_triton_siso(
+            all_k_flat,
+            cos_sin_cache=cos_sin_cache,
+            positions=positions_repeated,
+            rope_dim=self._rope_rotary_dim,
+            is_neox_style=self._rope_is_neox,
+        )
+    else:
+        # Non-triton fallback: the module's custom op rotates in place but
+        # requires a writable key tensor, so keep the clone on this path.
+        all_k_flat = all_k_normed.view(L * num_ctx, kv)
+        tmpv = all_k_flat.clone()
+        self.layers[0].self_attn.rotary_emb(positions_repeated, all_k_flat, tmpv)
+        all_k_flat = all_k_flat.view(L * num_ctx, nkv, hd)
 
     if context_slot_mapping is None:
         return
