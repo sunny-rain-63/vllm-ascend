@@ -58,6 +58,11 @@ class TestAscendUnquantizedLinearMethod(TestBase):
         type(self.layer.weight.data).dtype = mock_dtype
         mock_is_meta = mock.PropertyMock(return_value=False)
         type(self.layer.weight.data).is_meta = mock_is_meta
+
+        # maybe_trans_nz reads ndim/shape to screen out k=1/n=1 weights, so the
+        # mock must expose a realistic 2D (non-singleton) shape, not a MagicMock.
+        type(self.layer.weight.data).ndim = mock.PropertyMock(return_value=2)
+        type(self.layer.weight.data).shape = mock.PropertyMock(return_value=torch.Size([64, 32]))
         self.layer.precast_fp32_weight = False
         self.layer.skip_weight_nz_conversion = False
 
@@ -129,6 +134,45 @@ class TestAscendUnquantizedLinearMethod(TestBase):
         self.assertEqual(layer.weight_fp32.dtype, torch.float32)
         torch.testing.assert_close(layer.weight_fp32, weight.to(torch.float32))
         mock_format_cast.assert_not_called()
+
+
+class TestShouldReshapeWoATo3d(unittest.TestCase):
+    """Tests for _should_reshape_wo_a_to_3d — DSV4 wo_a 3D layout decision."""
+
+    @staticmethod
+    def _profile_supporting(mx_quant_fusion: bool):
+        profile = MagicMock()
+        profile.supports.return_value = mx_quant_fusion
+        return profile
+
+    def _reshape_decision(self, prefix, dtype, mx_quant_fusion):
+        with patch(
+            "vllm_ascend.ops.linear.get_current_hardware_profile",
+            return_value=self._profile_supporting(mx_quant_fusion),
+        ):
+            from vllm_ascend.ops.linear import _should_reshape_wo_a_to_3d
+
+            return _should_reshape_wo_a_to_3d(prefix, dtype)
+
+    def test_bf16_wo_a_reshapes_on_a5(self):
+        """Regression: ModelSlim keeps unquantized bf16 wo_a while the model
+        carries a global quant config; it still needs the 3D reshape in
+        weight_loader (previously gated on quant_config is None)."""
+        self.assertTrue(self._reshape_decision("model.layers.0.self_attn.wo_a", torch.bfloat16, mx_quant_fusion=True))
+
+    def test_bf16_wo_a_reshapes_without_mx_quant_fusion(self):
+        self.assertTrue(self._reshape_decision("model.layers.0.self_attn.wo_a", torch.bfloat16, mx_quant_fusion=False))
+
+    def test_quantized_wo_a_not_reshaped_by_weight_loader(self):
+        """fp8 wo_a is left to the quantization path (process_weights_after_loading)."""
+        self.assertFalse(
+            self._reshape_decision("model.layers.0.self_attn.wo_a", torch.float8_e4m3fn, mx_quant_fusion=True)
+        )
+
+    def test_non_wo_a_layer_not_reshaped(self):
+        self.assertFalse(
+            self._reshape_decision("model.layers.0.self_attn.o_proj", torch.bfloat16, mx_quant_fusion=True)
+        )
 
 
 class TestAscendRowParallelLinear(BaseLinearTest):
