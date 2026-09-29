@@ -20,6 +20,7 @@ from vllm.forward_context import BatchDescriptor, get_forward_context
 from vllm.logger import logger
 from vllm.platforms import current_platform
 
+import vllm_ascend.envs as envs_ascend
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 
@@ -290,8 +291,14 @@ class ACLGraphWrapper:
         # we do not need to synchronize.
         # When enable_enpu is on, model_runner orders update vs replay; skip here.
         # When FULL + EAGLE draft (merge path), replay does not need this barrier.
-        is_draft_eagle = _EXTRA_CTX.is_draft_model and self.use_eagle
-        need_sync = self.runtime_mode == CUDAGraphMode.FULL and not is_draft_eagle
+        # Non-EAGLE drafts (e.g. DFlash merged draft) also issue their graph-param
+        # update on the same thread right after replay, ordered device-side through
+        # update_stream, so the barrier is redundant for the same reason; the skip
+        # stays opt-in via VLLM_ASCEND_SKIP_DRAFT_REPLAY_SYNC until validated on device.
+        skip_draft_barrier = _EXTRA_CTX.is_draft_model and (
+            self.use_eagle or envs_ascend.VLLM_ASCEND_SKIP_DRAFT_REPLAY_SYNC
+        )
+        need_sync = self.runtime_mode == CUDAGraphMode.FULL and not skip_draft_barrier
         if not self.enable_enpu and need_sync:
             torch.npu.current_stream().synchronize()
         if self.runtime_mode == CUDAGraphMode.FULL and use_updatable_graph(self.attn_backend):

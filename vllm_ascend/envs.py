@@ -87,6 +87,12 @@ env_variables: dict[str, Callable[[], Any]] = {
     # (safe for Ascend 910B/A3). Set to a positive value to override when
     # auto-detection is unavailable or for debugging UB overflow issues.
     "VLLM_ASCEND_ROPE_UB_SIZE_KB": lambda: int(os.getenv("VLLM_ASCEND_ROPE_UB_SIZE_KB") or 0),
+    # Skip the host-blocking synchronize before FULL-mode non-EAGLE draft graph
+    # replay (e.g. DFlash merged draft). The draft's graph-param update is
+    # issued on the same thread right after replay and ordered device-side via
+    # update_stream, so the barrier is redundant for the same reason as the
+    # EAGLE merge path. 0 (default): keep the barrier. 1: skip it.
+    "VLLM_ASCEND_SKIP_DRAFT_REPLAY_SYNC": lambda: _strict_binary_env("VLLM_ASCEND_SKIP_DRAFT_REPLAY_SYNC"),
 }
 
 # end-env-vars-definition
