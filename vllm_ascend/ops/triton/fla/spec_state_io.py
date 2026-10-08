@@ -16,10 +16,12 @@ def prepare_spec_states_kernel(
     starts,
     lengths,
     active,
+    packed_indices,
     state_stride: tl.int64,
     table_row_stride,
     table_col_stride,
     NUM_STATES: tl.constexpr,
+    TOKENS: tl.constexpr,
     WIDTH: tl.constexpr,
     ROW_SIZE: tl.constexpr,
     BLOCK: tl.constexpr,
@@ -42,6 +44,10 @@ def prepare_spec_states_kernel(
             tl.store(lengths, 0)
         for col in range(WIDTH):
             tl.store(active + begin + col, valid, mask=begin + col < end)
+            # Fixed-width slots partition all TOKENS, including graph padding
+            # and empty requests, without depending on the live query lengths.
+            slot = req * WIDTH + col
+            tl.store(packed_indices + slot, slot + 1, mask=slot < TOKENS)
 
 
 @triton.jit

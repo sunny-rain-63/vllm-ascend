@@ -84,7 +84,7 @@ def recurrent_gated_delta_rule_spec(
         # FLA initializes every live row, so only initial rows need gathering.
         workspace = torch.empty((tokens + 1, *state.shape[1:]), dtype=state.dtype, device=state.device)
         lengths = torch.empty(num_reqs + 1, dtype=torch.int32, device=state.device)
-        packed_indices = torch.arange(1, tokens + 1, dtype=torch.int32, device=state.device)
+        packed_indices = torch.empty(tokens, dtype=torch.int32, device=state.device)
         active = torch.zeros(tokens, dtype=torch.bool, device=state.device)
         starts = query_start_loc.contiguous()
         prepare_spec_states_kernel[(triton.cdiv(row_size, SPEC_STATE_IO_BLOCK_SIZE), num_reqs)](
@@ -95,10 +95,12 @@ def recurrent_gated_delta_rule_spec(
             starts,
             lengths,
             active,
+            packed_indices,
             state.stride(0),
             ssm_state_indices.stride(0),
             ssm_state_indices.stride(1),
             NUM_STATES=state.shape[0],
+            TOKENS=tokens,
             WIDTH=width,
             ROW_SIZE=row_size,
             BLOCK=SPEC_STATE_IO_BLOCK_SIZE,

@@ -8,6 +8,62 @@ import torch_npu  # noqa: F401
 
 from vllm_ascend.ops.triton.fla import recurrent_gdn
 from vllm_ascend.ops.triton.fla.recurrent_gdn import recurrent_gated_delta_rule_spec
+from vllm_ascend.ops.triton.fla.spec_state_io import SPEC_STATE_IO_BLOCK_SIZE, prepare_spec_states_kernel
+
+
+@pytest.mark.parametrize("width", [1, 3, 8])
+@pytest.mark.parametrize("graph_mode", [False, True])
+@torch.inference_mode()
+def test_packed_indices_cover_empty_requests_and_graph_padding(width, graph_mode):
+    num_reqs, row_size = 3, 4
+    tokens = num_reqs * width - 1
+    state = torch.zeros(2, row_size, device="npu")
+    workspace = torch.empty(tokens + 1, row_size, device="npu")
+    table = torch.zeros(num_reqs, width, dtype=torch.int32, device="npu")
+    accepted = torch.ones(num_reqs, dtype=torch.int32, device="npu")
+    starts = torch.zeros(num_reqs + 1, dtype=torch.int32, device="npu")
+    lengths = torch.empty_like(starts)
+    active = torch.zeros(tokens, dtype=torch.bool, device="npu")
+    packed = torch.empty(tokens, dtype=torch.int32, device="npu")
+
+    def run():
+        prepare_spec_states_kernel[(1, num_reqs)](
+            state,
+            workspace,
+            table,
+            accepted,
+            starts,
+            lengths,
+            active,
+            packed,
+            state.stride(0),
+            table.stride(0),
+            table.stride(1),
+            NUM_STATES=state.shape[0],
+            TOKENS=tokens,
+            WIDTH=width,
+            ROW_SIZE=row_size,
+            BLOCK=SPEC_STATE_IO_BLOCK_SIZE,
+        )
+
+    run()
+    if graph_mode:
+        graph = torch.npu.NPUGraph()
+        with torch.npu.graph(graph):
+            run()
+    # Reinitialize on every replay, even when all requests have zero length.
+    for offsets in ([0, 0, 0, 0], [0, 0, width, 2 * width]):
+        starts.copy_(torch.tensor(offsets, dtype=torch.int32))
+        packed.fill_(-11)
+        if graph_mode:
+            graph.replay()
+        else:
+            run()
+        torch.npu.synchronize()
+        torch.testing.assert_close(packed.cpu(), torch.arange(1, tokens + 1, dtype=torch.int32))
+        torch.testing.assert_close(
+            lengths.cpu(), torch.tensor([0, *torch.diff(starts.cpu()).tolist()], dtype=torch.int32)
+        )
 
 
 def reference_recurrent(query, key, value, state, g, beta, scale, starts, indices, accepted):

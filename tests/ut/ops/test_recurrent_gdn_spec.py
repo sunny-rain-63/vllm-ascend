@@ -71,7 +71,11 @@ def test_fla_stages_only_batch_states_and_scatter_keeps_original_cache(monkeypat
     assert workspace.shape == (11, 2, 3, 4)  # 10 scheduled tokens, not 19 cache rows
     assert workspace.untyped_storage().data_ptr() != inputs["state"].untyped_storage().data_ptr()
     assert fused.call_args.kwargs["num_accepted_tokens"] is None
-    assert fused.call_args.kwargs["ssm_state_indices"].tolist() == list(range(1, 11))
+    packed_indices = fused.call_args.kwargs["ssm_state_indices"]
+    assert packed_indices.shape == (10,)
+    assert packed_indices.dtype == torch.int32
+    assert prepare.__getitem__.return_value.call_args.args[7] is packed_indices
+    assert prepare.__getitem__.return_value.call_args.kwargs["TOKENS"] == 10
     assert prepare.__getitem__.return_value.call_args.args[0] is inputs["state"]
     assert scatter.__getitem__.return_value.call_args.args[1] is inputs["state"]
     assert scatter.__getitem__.return_value.call_args.args[6] == inputs["state"].stride(0)
