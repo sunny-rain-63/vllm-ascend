@@ -108,6 +108,40 @@ def test_gather_and_scatter_ssm_states(
             )
 
 
+@pytest.mark.parametrize("padding", [0, 13])
+def test_triton_prefill_state_roundtrip_preserves_shared_pages(padding: int) -> None:
+    # Cache stores [H, V, K]; Triton prefill consumes [H, K, V]. Use
+    # rectangular, nonuniform states to detect transpose and stride mistakes.
+    shape = (2, 3, 5)
+    row_size = math.prod(shape)
+    stride = row_size + padding
+    offset = 7
+    storage = torch.full((offset + 5 * stride,), -17.0, device="npu")
+    state = torch.as_strided(storage, (5, *shape), (stride, 15, 5, 1), storage_offset=offset)
+    initial = torch.arange(5 * row_size, dtype=torch.float32).reshape(5, *shape)
+    state.copy_(initial.to("npu"))
+    expected_storage = storage.cpu()
+    indices = torch.tensor([3, 0, 2], dtype=torch.int32, device="npu")
+    has_initial_state = torch.tensor([True, False, True], device="npu")
+    expected = initial[[3, 0, 2]].clone()
+    expected[1].zero_()
+
+    # Repeated prefill chunks must read the previous write, while neighboring
+    # requests and page padding retain their original values.
+    for step in range(3):
+        gathered = gather_ssm_states(state, indices, has_initial_state)
+        triton_initial = gathered.transpose(-1, -2).contiguous()
+        torch.testing.assert_close(triton_initial.cpu(), expected.transpose(-1, -2), rtol=0, atol=0)
+        final_state = triton_initial + step + 1
+        scatter_ssm_states_(state, indices, final_state.transpose(-1, -2).contiguous())
+        expected += step + 1
+        for selected, block in enumerate((3, 0, 2)):
+            start = offset + block * stride
+            expected_storage[start : start + row_size] = expected[selected].reshape(-1)
+        torch.testing.assert_close(storage.cpu(), expected_storage, rtol=0, atol=0)
+        has_initial_state.fill_(True)
+
+
 def test_rejects_empty_state_cache() -> None:
     state = torch.empty((0, 8), dtype=torch.float32, device="npu")
     indices = torch.empty((0,), dtype=torch.int32, device="npu")
