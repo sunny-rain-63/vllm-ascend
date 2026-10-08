@@ -91,6 +91,7 @@ from vllm_ascend.utils import (
     kv_cache_spec_uses_packed_sfa_main_cache,
 )
 from vllm_ascend.worker.kvpp_cache import allocate_kvpp_cache
+from vllm_ascend.worker.v2.kv_cache_utils import reshape_paged_attention_kv_cache
 
 if TYPE_CHECKING:
     from vllm_ascend.worker.v2.pcp_manager import AscendPCPAttentionContext
@@ -140,39 +141,6 @@ def unwrap_mamba_kv_cache_groups(kv_cache_config: KVCacheConfig) -> KVCacheConfi
                 group = replace(group, kv_cache_spec=layer_specs[0])
         groups.append(group)
     return replace(kv_cache_config, kv_cache_groups=groups)
-
-
-def _align_hybrid_attention_page_sizes(kv_cache_specs: dict[str, KVCacheSpec]) -> None:
-    """Align dense K/V segments before padding a shared Attention/Mamba pool."""
-    # MLA and compressed-cache subclasses manage their own storage layouts.
-    attention_specs = {
-        name: spec for name, spec in kv_cache_specs.items() if type(spec) in (FullAttentionSpec, SlidingWindowSpec)
-    }
-    if not attention_specs:
-        return
-    reference = max(attention_specs.values(), key=lambda spec: spec.real_page_size_bytes)
-    page_size = reference.real_page_size_bytes
-    for layer_name, spec in attention_specs.items():
-        # Ascend packs each layer as [all K blocks][all V blocks]. Equal
-        # padded pages alone do not isolate block IDs: a smaller SWA K segment
-        # can overlap another request's full-attention V block. Grow scheduler
-        # blocks before padding; the backend still splits them into kernel blocks.
-        if (
-            page_size % spec.real_page_size_bytes
-            or spec.head_size * reference.head_size_v != reference.head_size * spec.head_size_v
-        ):
-            raise ValueError(
-                f"Cannot align hybrid attention K/V pages for {layer_name}: "
-                "the shared contiguous cache requires matching K/V size ratios "
-                "and divisible unpadded page sizes."
-            )
-        ratio = page_size // spec.real_page_size_bytes
-        if ratio > 1:
-            kv_cache_specs[layer_name] = replace(
-                spec,
-                block_size=spec.block_size * ratio,
-                page_size_padded=max(spec.page_size_padded, page_size) if spec.page_size_padded is not None else None,
-            )
 
 
 def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
@@ -305,7 +273,8 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
             continue
 
     if mamba_specs:
-        _align_hybrid_attention_page_sizes(kv_cache_spec)
+        # Block-strided views isolate each scheduler page, so draft layers
+        # retain their own logical block sizes even with different K/V widths.
         common_page_size = max(spec.page_size_bytes for spec in (*kv_cache_spec.values(), *mamba_specs.values()))
         for layer_name in attention_layer_names:
             spec = kv_cache_spec[layer_name]
@@ -647,41 +616,6 @@ def _adjust_dsv4_kv_layout(
     return caches
 
 
-def _reshape_combined_attention_kv_cache(
-    raw_cache: torch.Tensor,
-    kv_cache_shape: tuple[int, ...],
-    dtype: torch.dtype,
-    page_stride_bytes: int,
-    num_blocks_per_kv_block: int = 1,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Create block-strided K/V views over padded physical pages."""
-    if len(kv_cache_shape) != 5 or kv_cache_shape[0] != 2:
-        raise ValueError("Combined Attention cache must have shape [K/V, blocks, block_size, heads, dim].")
-    dtype_size = get_dtype_size(dtype)
-    if page_stride_bytes % dtype_size:
-        raise ValueError("Physical Attention page is not aligned to its dtype.")
-
-    hidden_size = math.prod(kv_cache_shape[2:])
-    if num_blocks_per_kv_block < 1:
-        raise ValueError("The number of kernel blocks per KV block must be positive.")
-    if page_stride_bytes % (num_blocks_per_kv_block * dtype_size):
-        raise ValueError("Padded combined Attention pages must split into dtype-aligned kernel blocks.")
-    kernel_stride_bytes = page_stride_bytes // num_blocks_per_kv_block
-    if kernel_stride_bytes < 2 * hidden_size * dtype_size:
-        raise ValueError("Physical Attention page is too small for its kernel blocks.")
-    dense_strides = [math.prod(kv_cache_shape[dim + 1 :]) for dim in range(len(kv_cache_shape))]
-    combined_cache = torch.as_strided(
-        raw_cache.view(dtype),
-        size=kv_cache_shape,
-        stride=(
-            hidden_size,
-            kernel_stride_bytes // dtype_size,
-            *dense_strides[2:],
-        ),
-    )
-    return combined_cache[0], combined_cache[1]
-
-
 def _view_dsv4_cache(
     raw_tensor: torch.Tensor,
     kv_cache_spec: AttentionSpec,
@@ -840,7 +774,7 @@ def _allocate_kv_cache(
     Initialize the KV cache buffer with the correct size. The buffer needs to be
     reshaped to the desired shape before being used by the models.
 
-    FullAttention caches use a combined allocation for block-strided K/V
+    FullAttention and SlidingWindow caches use a combined allocation for block-strided K/V
     views. Specialized caches keep their existing allocation layouts.
     KV transfer aligns each raw allocation to 2 MiB.
 
@@ -1090,11 +1024,11 @@ def _allocate_kv_cache(
             k_size = kv_cache_tensor_size
             for layer_name in shared_names:
                 kv_cache_raw_tensors[layer_name] = _allocate_int8_cache_tensor(k_size, alignment, device)
-        elif type(example_spec) is FullAttentionSpec and not enable_sfa(vllm_config):
+        elif type(example_spec) in (FullAttentionSpec, SlidingWindowSpec) and not enable_sfa(vllm_config):
             for layer_name in shared_names:
                 layer_spec = layer_kv_cache_spec[layer_name]
                 layer_size = kv_cache_config.num_blocks * layer_spec.page_size_bytes
-                if type(layer_spec) is not FullAttentionSpec:
+                if type(layer_spec) not in (FullAttentionSpec, SlidingWindowSpec):
                     kv_cache_raw_tensors[layer_name] = _allocate_int8_cache_tensor(layer_size, alignment, device)
                     continue
                 if attn_layers is None:
@@ -1109,7 +1043,7 @@ def _allocate_kv_cache(
                 if layer_spec.page_size_bytes != layer_spec.real_page_size_bytes:
                     raise ValueError(
                         f"Sparse Attention backend for {layer_name} requires "
-                        "unpadded FullAttention pages for contiguous K/V cache."
+                        "unpadded Attention pages for contiguous K/V cache."
                     )
                 k_dim, v_dim = _get_attention_kv_cache_dims(layer_name, layer_spec)
                 if enable_fa_quant(vllm_config):
@@ -1565,12 +1499,13 @@ def _reshape_kv_cache_v2(
                     k_cache = typed_cache[padding_elements : padding_elements + k_elements].view(k_shape)
                     v_cache = typed_cache[padding_elements + k_elements :].view(v_shape)
                 else:
-                    k_cache, v_cache = _reshape_combined_attention_kv_cache(
+                    k_cache, v_cache = reshape_paged_attention_kv_cache(
                         raw_cache,
                         kv_cache_shape,
                         k_dtype,
                         page_stride_bytes,
                         num_blocks_per_kv_block,
+                        head_size_v=kv_cache_spec.head_size_v,
                     )
                 kv_caches[layer_name] = (k_cache, v_cache)
                 logger.debug(

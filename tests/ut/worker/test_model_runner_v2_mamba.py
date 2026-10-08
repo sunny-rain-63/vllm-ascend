@@ -1,5 +1,4 @@
 import ast
-from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -26,7 +25,6 @@ from vllm_ascend.device.hardware import AscendDeviceType
 from vllm_ascend.device.hardware_profile import get_hardware_profile
 from vllm_ascend.worker.v2 import attn_utils
 from vllm_ascend.worker.v2.attn_utils import (
-    _align_hybrid_attention_page_sizes,
     _allocate_kv_cache,
     _reshape_kv_cache_v2,
     get_kv_cache_spec,
@@ -713,7 +711,7 @@ def test_mamba_spec_follows_aligned_attention_spec(
 
 @pytest.mark.parametrize("include_mamba", [False, True])
 @patch("vllm_ascend.worker.v2.attn_utils.get_layers_from_vllm_config")
-def test_get_kv_cache_spec_rejects_nondivisible_hybrid_attention_pages(
+def test_get_kv_cache_spec_preserves_nondivisible_hybrid_attention_blocks(
     mock_get_layers,
     include_mamba,
 ):
@@ -758,8 +756,10 @@ def test_get_kv_cache_spec_rejects_nondivisible_hybrid_attention_pages(
     }
 
     if include_mamba:
-        with pytest.raises(ValueError, match="Cannot align hybrid attention K/V pages for small_attn"):
-            get_kv_cache_spec(_mock_vllm_config())
+        specs = get_kv_cache_spec(_mock_vllm_config())
+        assert specs["small_attn"].block_size == small_attention_spec.block_size
+        assert specs["large_attn"].block_size == large_attention_spec.block_size
+        assert all(spec.page_size_bytes == 80 for spec in specs.values())
     else:
         del mock_get_layers.return_value["linear_attn"]
         # Non-hybrid allocation does not use the shared Attention/Mamba layout.
@@ -858,30 +858,11 @@ def test_hybrid_dflash_writes_preserve_other_request_blocks(
                     torch.testing.assert_close(target_cache[other_blocks], expected[other_blocks])
     assert specs["draft.sliding"].sliding_window == sliding.sliding_window
     assert specs["draft.sliding"].extra_retained_tokens == sliding.extra_retained_tokens
-    assert specs["draft.sliding"].block_size == full_block_size * 2 // draft_num_kv_heads
-    assert specs["draft.full"].block_size == specs["draft.sliding"].block_size
+    assert specs["draft.sliding"].block_size == sliding.block_size
+    assert specs["draft.full"].block_size == draft_full.block_size
     assert specs["draft.full"].non_causal is True
     assert specs["target.gdn"] == mamba
     assert sliding.block_size == 128
-
-
-def test_hybrid_attention_alignment_rejects_different_k_v_proportions():
-    full = FullAttentionSpec(block_size=128, num_kv_heads=1, head_size=2, dtype=torch.float16)
-    # Equal total page sizes still do not make the K and V segments compatible.
-    sliding = SlidingWindowSpec(
-        block_size=128, num_kv_heads=1, head_size=1, head_size_v=3, dtype=torch.float16, sliding_window=4096
-    )
-    assert full.real_page_size_bytes == sliding.real_page_size_bytes
-    with pytest.raises(ValueError, match="matching K/V size ratios"):
-        _align_hybrid_attention_page_sizes({"full": full, "sliding": sliding})
-
-
-def test_hybrid_attention_alignment_preserves_mla_specs():
-    mla = AscendMLAAttentionSpec(block_size=128, num_kv_heads=1, head_size=8, dtype=torch.float16)
-    specs = {"mla": mla, "padded_mla": replace(mla, page_size_padded=4096)}
-    original = specs.copy()
-    _align_hybrid_attention_page_sizes(specs)
-    assert specs == original
 
 
 @patch("vllm_ascend.worker.v2.model_states.mamba_hybrid.AscendMambaHybridModelState")
