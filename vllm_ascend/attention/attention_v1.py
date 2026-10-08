@@ -902,11 +902,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
         ):
             key = key[:num_tokens]
             value = value[:num_tokens]
-        speculative_config = self.vllm_config.speculative_config
-        dflash_eager = speculative_config is not None and speculative_config.method == "dflash"
-        if block_table is None or dflash_eager:
-            # Stage read-only inputs for DFlash drafting and target verification.
-            # Keep writes bound to the original caches and leave graph views intact.
+        if block_table is None:
             key = key.contiguous()
             value = value.contiguous()
 

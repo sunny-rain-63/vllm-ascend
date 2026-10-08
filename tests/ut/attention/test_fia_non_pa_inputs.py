@@ -156,7 +156,7 @@ def test_forward_non_pa_branches_receive_contiguous_kv(branch, contiguous, cross
 @pytest.mark.parametrize("method", [None, "mtp", "dflash"])
 @pytest.mark.parametrize("branch", ["causal", "non_causal", "sliding_window"])
 @pytest.mark.parametrize("use_bnsd", [False, True])
-def test_eager_dflash_stages_cache_reads_without_rebinding_writes(method, branch, use_bnsd):
+def test_eager_pa_preserves_cache_storage_with_speculative_decoding(method, branch, use_bnsd):
     impl = _make_impl()
     impl.vllm_config.speculative_config = SimpleNamespace(method=method) if method else None
     impl.use_bnsd_kv_cache = use_bnsd
@@ -195,8 +195,9 @@ def test_eager_dflash_stages_cache_reads_without_rebinding_writes(method, branch
             for name, original in (("key", original_key), ("value", original_value)):
                 actual = kwargs[name]
                 torch.testing.assert_close(actual.reshape(original.shape), original)
-                assert actual.is_contiguous() == (method == "dflash")
-                assert (actual.data_ptr() == original.data_ptr()) == (method != "dflash")
+                assert not actual.is_contiguous()
+                assert actual.data_ptr() == original.data_ptr()
+                assert actual.stride(0) == original.stride(0)
 
 
 @pytest.mark.parametrize("v2", [False, True])
