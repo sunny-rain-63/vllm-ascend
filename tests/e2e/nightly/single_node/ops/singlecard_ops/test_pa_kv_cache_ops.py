@@ -124,3 +124,81 @@ def test_dflash_context_and_query_writes_to_strided_pages(dtype, splits, graph_m
             expected[begin : begin + heads * dim] = key[token].cpu().flatten()
             expected[begin + block_elements : begin + block_elements + heads * dim] = value[token].cpu().flatten()
     torch.testing.assert_close(storage.cpu(), expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("splits", [1, 4, 9])
+@pytest.mark.parametrize("graph_mode", [False, True])
+def test_dflash_fia_reads_strided_pages_after_cache_updates(dtype, splits, graph_mode):
+    """Check noncausal draft attention against a dense CPU oracle after replay.
+
+    Different requests use permuted, disjoint blocks. Updating the cache after
+    capture detects stale dense copies as well as incorrect physical strides.
+    """
+    torch.manual_seed(0)
+    block_size, kv_heads, query_heads, dim = 128, 2, 4, 64
+    num_blocks = 4 * splits
+    kernel_elements = block_size * kv_heads * dim
+    page_elements = splits * (2 * kernel_elements + 128)
+    storage = torch.zeros(4 * page_elements, dtype=dtype, device="npu")
+    raw = storage.view(torch.int8)
+    key_cache, value_cache = reshape_paged_attention_kv_cache(
+        raw, (2, num_blocks, block_size, kv_heads, dim), dtype, page_elements * storage.element_size(), splits
+    )
+    # Flatten only the dense head dimensions, exactly as the attention backend.
+    key_view = key_cache.view(num_blocks, block_size, -1)
+    value_view = value_cache.view(num_blocks, block_size, -1)
+    assert not key_view.is_contiguous() and not value_view.is_contiguous()
+    block_ids = [[num_blocks - 1, 1], [2, 0]]
+    block_table = torch.tensor(block_ids, dtype=torch.int32, device="npu")
+    seq_lens = [block_size + 7, block_size + 3]
+    queries_per_req = 8  # Anchor plus seven speculative tokens.
+    query = torch.randn(2 * queries_per_req, query_heads, dim).to(dtype).to("npu")
+
+    def attend():
+        return torch_npu.npu_fused_infer_attention_score(
+            query=query,
+            key=key_view,
+            value=value_view,
+            block_table=block_table,
+            block_size=block_size,
+            actual_seq_lengths=[queries_per_req, 2 * queries_per_req],
+            actual_seq_lengths_kv=seq_lens,
+            num_heads=query_heads,
+            num_key_value_heads=kv_heads,
+            input_layout="TND",
+            scale=dim**-0.5,
+            sparse_mode=0,
+        )[0]
+
+    attend()  # Warm up tiling/compilation before capture.
+    if graph_mode:
+        graph = torch.npu.NPUGraph()
+        with torch.npu.graph(graph):
+            output = attend()
+
+    slots = torch.arange(num_blocks * block_size, dtype=torch.int32, device="npu")
+    for _ in range(3):
+        key_cpu = torch.randn(num_blocks, block_size, kv_heads, dim).to(dtype)
+        value_cpu = torch.randn_like(key_cpu)
+        DeviceOperator.reshape_and_cache(
+            key_cpu.flatten(0, 1).to("npu"),
+            value_cpu.flatten(0, 1).to("npu"),
+            key_cache,
+            value_cache,
+            slots,
+        )
+        if graph_mode:
+            graph.replay()
+        else:
+            output = attend()
+        torch.npu.synchronize()
+        expected = []
+        for req, (blocks, seq_len) in enumerate(zip(block_ids, seq_lens)):
+            key = key_cpu[blocks].flatten(0, 1)[:seq_len].repeat_interleave(query_heads // kv_heads, dim=1)
+            value = value_cpu[blocks].flatten(0, 1)[:seq_len].repeat_interleave(query_heads // kv_heads, dim=1)
+            q = query[req * queries_per_req : (req + 1) * queries_per_req].cpu().float().transpose(0, 1)
+            scores = q @ key.float().permute(1, 2, 0) * dim**-0.5
+            expected.append((scores.softmax(-1) @ value.float().transpose(0, 1)).transpose(0, 1))
+        tolerance = 2e-2 if dtype == torch.bfloat16 else 2e-3
+        torch.testing.assert_close(output.cpu().float(), torch.cat(expected), atol=tolerance, rtol=tolerance)
