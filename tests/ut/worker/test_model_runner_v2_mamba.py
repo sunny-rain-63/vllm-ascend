@@ -18,6 +18,7 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
+from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
 
 from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
@@ -168,6 +169,44 @@ def test_mamba_model_state_inherits_upstream_state_management():
 
 def test_mrv2_advertises_standardized_shared_kv_backing():
     assert NPUModelRunner.supports_standardized_shared_kv_backing is True
+
+
+@pytest.mark.parametrize("block_size", [64, 256])
+@pytest.mark.parametrize(
+    "computed_tokens,expected_column",
+    [(0, -1), (1, 0), (128, 0), (256, 0), (257, 1), (512, 1), (513, 2), (4096, 15)],
+)
+def test_add_request_seeds_mamba_column_with_mamba_block_size(block_size, computed_tokens, expected_column):
+    state = AscendMambaHybridModelState.__new__(AscendMambaHybridModelState)
+    state.cache_config = SimpleNamespace(block_size=block_size, mamba_block_size=256)
+    state._align_mode = True
+    state._mamba_state_idx_gpu = torch.full((3,), 99, dtype=torch.int32)
+    state.num_accepted_tokens_gpu = torch.full((3,), 7, dtype=torch.int32)
+    original_indices = state._mamba_state_idx_gpu
+    request = SimpleNamespace(num_computed_tokens=computed_tokens)
+
+    with patch.object(DefaultModelState, "add_request", autospec=True) as parent_add:
+        state.add_request(1, request)
+
+    parent_add.assert_called_once_with(state, 1, request)
+    assert state._mamba_state_idx_gpu is original_indices
+    assert state._mamba_state_idx_gpu.tolist() == [99, expected_column, 99]
+    assert state.num_accepted_tokens_gpu.tolist() == [7, 1, 7]
+
+
+def test_add_request_without_align_keeps_upstream_acceptance_reset():
+    state = AscendMambaHybridModelState.__new__(AscendMambaHybridModelState)
+    state.cache_config = SimpleNamespace(block_size=64, mamba_block_size=None)
+    state._align_mode = False
+    state.num_accepted_tokens_gpu = torch.full((3,), 7, dtype=torch.int32)
+    request = SimpleNamespace(num_computed_tokens=512)
+
+    with patch.object(DefaultModelState, "add_request", autospec=True) as parent_add:
+        state.add_request(1, request)
+
+    parent_add.assert_called_once_with(state, 1, request)
+    assert state.num_accepted_tokens_gpu.tolist() == [7, 1, 7]
+    assert not hasattr(state, "_mamba_state_idx_gpu")
 
 
 def _make_defer_state(kv_cache_config):

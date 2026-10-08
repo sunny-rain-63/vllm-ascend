@@ -17,6 +17,8 @@ from vllm_ascend.ops.gdn_attn_builder import (
     GDNCausalConv1dMetadata,
     GDNDecodeMetadata,
     GDNPrefillMetadata,
+    GDNSpecCausalConv1dMetadata,
+    GDNSpecDecodeMetadata,
 )
 
 
@@ -108,6 +110,68 @@ def _make_layer() -> SimpleNamespace:
         side_effect=rearrange_mixed_qkv,
     )
     return layer
+
+
+def test_spec_forward_keeps_fixed_width_state_table():
+    layer = _make_layer()
+    layer.num_spec = 7
+    table = torch.arange(1, 17, dtype=torch.int32).reshape(2, 8)
+    starts = torch.tensor([0, 2, 10], dtype=torch.int32)
+    accepted = torch.tensor([8, 5], dtype=torch.int32)
+    layer.kv_cache = (torch.zeros(17, 8, 6), torch.zeros(17, 1, 2, 2))
+    metadata = GDNAttentionMetadata(
+        num_prefills=0,
+        num_prefill_tokens=0,
+        num_decodes=0,
+        num_decode_tokens=0,
+        num_spec_decodes=2,
+        num_spec_decode_tokens=10,
+        num_actual_tokens=10,
+        spec_sequence_masks=torch.tensor([True, True]),
+        spec_state_indices_tensor=table,
+        spec_query_start_loc=starts,
+        num_accepted_tokens=accepted,
+    )
+    metadata.spec_decode_metadata = GDNSpecDecodeMetadata(
+        spec_causal_conv1d=GDNSpecCausalConv1dMetadata(
+            query_start_loc=starts,
+            cache_indices=table,
+            num_accepted_tokens=accepted,
+        ),
+        actual_seq_lengths=torch.tensor([0, 2, 8], dtype=torch.int32),
+    )
+    context = ForwardContext(
+        no_compile_layers={layer.prefix: layer}, attn_metadata={layer.prefix: metadata}, slot_mapping={}
+    )
+    mixed_qkv = torch.randn(10, 6)
+    output = torch.empty(10, 1, 2)
+    with (
+        override_forward_context(context),
+        patch("vllm_ascend.ops.gdn.wait_for_kv_layer_from_connector"),
+        patch("vllm_ascend.ops.gdn.record_attention_compute_start"),
+        patch("vllm_ascend.ops.gdn.maybe_save_kv_layer_to_connector"),
+        patch("vllm_ascend.ops.gdn.l2norm_fwd", side_effect=lambda x: x),
+        patch("vllm_ascend.ops.gdn.causal_conv1d_update", side_effect=lambda x, *a, **kw: x),
+        patch(
+            "vllm_ascend.ops.gdn.DeviceOperator.fused_gdn_gating",
+            return_value=(torch.zeros(1, 10, 1), torch.ones(1, 10, 1)),
+        ),
+        patch(
+            "vllm_ascend.ops.gdn.recurrent_gated_delta_rule", side_effect=lambda q, k, v, state, **kw: v
+        ) as packed_kernel,
+        patch(
+            "vllm_ascend.ops.gdn.recurrent_gated_delta_rule_spec", side_effect=lambda q, k, v, state, **kw: v
+        ) as spec_kernel,
+    ):
+        AscendGatedDeltaNetAttention._forward_core(layer, mixed_qkv, torch.zeros(10, 1), torch.zeros(10, 1), output)
+    packed_kernel.assert_not_called()
+    spec_kernel.assert_called_once()
+    kwargs = spec_kernel.call_args.kwargs
+    assert kwargs["ssm_state_indices"] is table
+    assert kwargs["query_start_loc"] is starts
+    assert kwargs["num_accepted_tokens"] is accepted
+    assert spec_kernel.call_args.args[3] is layer.kv_cache[1]
+    torch.testing.assert_close(output, mixed_qkv[:, -2:].reshape(10, 1, 2))
 
 
 def test_mixed_non_spec_reuses_rearranged_qkv() -> None:
