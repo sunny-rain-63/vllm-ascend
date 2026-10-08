@@ -276,7 +276,6 @@ def test_connector_observes_updated_gdn_state_for_each_compiled_call():
             return_value=SimpleNamespace(supports=lambda _: False),
         ),
         patch("vllm_ascend.ops.gdn.DeviceOperator.fused_gdn_gating", return_value=gating),
-        patch("vllm_ascend.ops.gdn.clear_ssm_states"),
         patch("vllm_ascend.ops.gdn.l2norm_fwd", side_effect=lambda x: x),
         patch.object(AscendGatedDeltaNetAttention, "_probe_fused_chunk", return_value=False),
         patch(
@@ -286,6 +285,10 @@ def test_connector_observes_updated_gdn_state_for_each_compiled_call():
             ),
         ),
         patch("vllm_ascend.ops.gdn.chunk_gated_delta_rule", side_effect=chunk_attention),
+        patch(
+            "vllm_ascend.ops.gdn.scatter_ssm_states_",
+            side_effect=lambda state, indices, source: state.index_copy_(0, indices.to(torch.long), source),
+        ),
         patch("vllm_ascend.ops.gdn.causal_conv1d_fn", side_effect=lambda x, *a, **k: causal_conv1d(x, *a, **k)),
         patch("vllm_ascend.ops.gdn.causal_conv1d_update", side_effect=lambda x, *a, **k: causal_conv1d(x, *a, **k)),
         patch("vllm_ascend.attention.utils.has_kv_transfer_group", return_value=True),

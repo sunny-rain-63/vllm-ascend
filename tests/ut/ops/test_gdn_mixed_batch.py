@@ -3,6 +3,7 @@
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import pytest
 import torch
 from torch import nn
 from vllm.forward_context import ForwardContext, override_forward_context
@@ -110,9 +111,20 @@ def _make_layer() -> SimpleNamespace:
     return layer
 
 
-def test_mixed_non_spec_reuses_rearranged_qkv() -> None:
+@pytest.mark.parametrize("padding", [0, 13])
+@pytest.mark.parametrize("has_initial_state", [False, True])
+def test_mixed_non_spec_reuses_rearranged_qkv(padding, has_initial_state) -> None:
     layer = _make_layer()
     metadata = _make_mixed_metadata()
+    metadata.prefill_has_initial_state.fill_(has_initial_state)
+    # Nonzero storage offset and a padded block stride model shared hybrid
+    # pages. Distinct inner values also detect a missing state transpose.
+    storage = torch.full((5 + 3 * (4 + padding),), -17.0)
+    state = torch.as_strided(storage, (3, 1, 2, 2), (4 + padding, 4, 2, 1), storage_offset=5)
+    state.copy_(torch.arange(12, dtype=torch.float32).reshape_as(state))
+    layer.kv_cache = (layer.kv_cache[0], state)
+    original_storage = storage.clone()
+    expected_initial = state[1:2].transpose(-1, -2).clone() if has_initial_state else torch.zeros(1, 1, 2, 2)
 
     # Token rows contain visibly different Q/K/V values so the assertions
     # can detect an incorrect decode/prefill boundary.
@@ -149,7 +161,12 @@ def test_mixed_non_spec_reuses_rearranged_qkv() -> None:
         return value.clone()
 
     def chunk_gated_delta_rule(**kwargs):
-        return kwargs["v"].clone(), kwargs["initial_state"].clone()
+        torch.testing.assert_close(kwargs["initial_state"], expected_initial)
+        return kwargs["v"].clone(), kwargs["initial_state"] + 100
+
+    def gather_states(cache, indices, has_initial_state, **kwargs):
+        gathered = cache.index_select(0, indices.to(torch.long))
+        return gathered.masked_fill(~has_initial_state[:, None, None, None], 0)
 
     # Shape [1, num_tokens, num_heads].
     gating = (
@@ -174,13 +191,14 @@ def test_mixed_non_spec_reuses_rearranged_qkv() -> None:
         patch("vllm_ascend.ops.gdn.l2norm_fwd", side_effect=lambda x: x),
         patch.object(AscendGatedDeltaNetAttention, "_probe_fused_chunk", return_value=True),
         patch.object(AscendGatedDeltaNetAttention, "_chunk_gated_delta_rule_fused") as fused_chunk_mock,
-        patch("vllm_ascend.ops.gdn.clear_ssm_states"),
         patch(
             "vllm_ascend.ops.gdn.gather_ssm_states",
-            side_effect=lambda state, indices, has_initial_state, **kwargs: state.index_select(
-                0, indices.to(torch.long)
-            ),
-        ),
+            side_effect=gather_states,
+        ) as gather_mock,
+        patch(
+            "vllm_ascend.ops.gdn.scatter_ssm_states_",
+            side_effect=lambda cache, indices, source: cache.index_copy_(0, indices.to(torch.long), source),
+        ) as scatter_mock,
         patch(
             "vllm_ascend.ops.gdn.chunk_gated_delta_rule",
             side_effect=chunk_gated_delta_rule,
@@ -197,6 +215,16 @@ def test_mixed_non_spec_reuses_rearranged_qkv() -> None:
             a,
             core_attn_out,
         )
+
+    gather_mock.assert_called_once_with(state, metadata.prefill_state_indices, metadata.prefill_has_initial_state)
+    scatter_mock.assert_called_once()
+    assert scatter_mock.call_args.args[0] is state
+    assert layer.kv_cache[1] is state
+    expected_storage = original_storage.clone()
+    start = 5 + state.stride(0)
+    expected_storage[start : start + 4] = (expected_initial + 100).transpose(-1, -2).reshape(-1)
+    # Includes unselected rows, leading storage and all inter-page padding.
+    torch.testing.assert_close(storage, expected_storage)
 
     # The recurrent decode kernel must receive the first token from the
     # already-rearranged full tensors.

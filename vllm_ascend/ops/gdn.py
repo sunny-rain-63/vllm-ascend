@@ -47,7 +47,6 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence im
 from vllm_ascend.ops.gdn_attn_builder import AscendGDNFusedAttentionBackend
 from vllm_ascend.ops.triton.fla.chunk import chunk_gated_delta_rule
 from vllm_ascend.ops.triton.fla.fused_qkvzba_split_reshape import fused_qkvzba_split_reshape_cat
-from vllm_ascend.ops.triton.fla.utils import clear_ssm_states
 from vllm_ascend.ops.triton.mamba.causal_conv1d import extract_last_width
 from vllm_ascend.ops.triton.mamba.state_index import gather_ssm_states, scatter_ssm_states_
 
@@ -680,8 +679,14 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                     last_recurrent_state,
                 )
             else:
-                initial_state = ssm_state[prefill_state_indices].transpose(-1, -2).contiguous()
-                clear_ssm_states(initial_state, prefill_has_initial_state)
+                # Hybrid cache pages can pad the batch stride. Use the same
+                # selected-row IO as the fused paths, retaining Triton's K/V
+                # state orientation without materializing the full cache.
+                initial_state = (
+                    gather_ssm_states(ssm_state, prefill_state_indices, prefill_has_initial_state)
+                    .transpose(-1, -2)
+                    .contiguous()
+                )
                 (core_attn_out_non_spec, last_recurrent_state) = chunk_gated_delta_rule(
                     q=query_non_spec,
                     k=key_non_spec,
@@ -695,8 +700,10 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                     head_first=False,
                     use_qk_l2norm_in_kernel=True,
                 )
-                ssm_state[prefill_state_indices] = (
-                    last_recurrent_state.transpose(-1, -2).contiguous().to(ssm_state.dtype)
+                scatter_ssm_states_(
+                    ssm_state,
+                    prefill_state_indices,
+                    last_recurrent_state.transpose(-1, -2).contiguous().to(ssm_state.dtype),
                 )
             if split_non_spec:
                 core_attn_out_non_spec = torch.cat(
