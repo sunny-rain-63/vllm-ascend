@@ -42,7 +42,10 @@ from vllm_ascend.worker.v2.attn_utils import (
     build_attn_metadata_wrapper,
 )
 from vllm_ascend.worker.v2.pcp_manager import AscendPCPManager
-from vllm_ascend.worker.v2.spec_decode.dflash.speculator import prepare_dflash_inputs_factory
+from vllm_ascend.worker.v2.spec_decode.dflash.speculator import (
+    _padded_block_tokens,
+    prepare_dflash_inputs_factory,
+)
 from vllm_ascend.worker.v2.spec_decode.lmhead_tp_utils import LmheadTPDraftSamplingMixin
 from vllm_ascend.worker.v2.spec_decode.pcp_utils import (
     disable_profiling_chunk_for_draft,
@@ -183,7 +186,8 @@ class AscendDSparkSpeculator(LmheadTPDraftSamplingMixin, DSparkSpeculator):
             else:
                 self.attn_architecture = None
             dflash_speculator.prepare_dflash_inputs = prepare_dflash_inputs_factory(
-                self.vllm_config.cache_config.block_size
+                self.vllm_config.cache_config.block_size,
+                _padded_block_tokens(kv_cache_config, self.draft_kv_cache_group_id),
             )
 
     def _prepare_draft_dcp_metadata_inputs(

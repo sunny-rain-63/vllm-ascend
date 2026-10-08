@@ -23,13 +23,50 @@ from vllm_ascend.worker.v2.spec_decode.pcp_utils import (
 )
 
 
-def prepare_dflash_inputs_factory(kv_cache_block_size: int) -> Callable[..., None]:
+def _padded_block_tokens(kv_cache_config: Any, group_id: int) -> int | None:
+    """Physical tokens per storage block, including hybrid-pool padding.
+
+    Hybrid Attention/Mamba pools (#14340) pad every group's physical page to a
+    common size, so the draft KV cache becomes block-strided (non-contiguous).
+    Returns the padded block size in tokens, or None when the pages are
+    unpadded and the legacy dense slot math applies.
+    """
+    spec = kv_cache_config.kv_cache_groups[group_id].kv_cache_spec
+    page_size_padded = getattr(spec, "page_size_padded", None)
+    if page_size_padded is None or page_size_padded == spec.page_size_bytes:
+        return None
+    if spec.page_size_bytes % spec.block_size:
+        raise ValueError(
+            f"Draft attention page {spec.page_size_bytes}B is not a whole number of "
+            f"{spec.block_size}-token blocks; cannot derive the DFlash slot stride."
+        )
+    token_bytes = spec.page_size_bytes // spec.block_size
+    if page_size_padded % token_bytes:
+        raise ValueError(
+            f"Hybrid-pool padded page {page_size_padded}B is not a whole number of "
+            f"{token_bytes}B tokens; DFlash cannot express the physical stride in "
+            "slot space."
+        )
+    return page_size_padded // token_bytes
+
+
+def prepare_dflash_inputs_factory(
+    kv_cache_block_size: int,
+    padded_block_tokens: int | None = None,
+) -> Callable[..., None]:
     # Upstream uses the attention kernel block size for DCP ownership, which is
     # incorrect when physical KV blocks are larger than kernel blocks. Bind the
     # physical size so ownership uses KV cache blocks while slot lookup uses the
     # kernel-sized block table supplied by the upstream caller.
+    # padded_block_tokens additionally adapts the slot math to hybrid-pool
+    # padded (non-contiguous) KV pages; None keeps the dense layout.
     def prepare_with_block_size(*args: Any, **kwargs: Any) -> None:
-        prepare_dflash_inputs(*args, **kwargs, kv_cache_block_size=kv_cache_block_size)
+        prepare_dflash_inputs(
+            *args,
+            **kwargs,
+            kv_cache_block_size=kv_cache_block_size,
+            padded_block_tokens=padded_block_tokens,
+        )
 
     return prepare_with_block_size
 
@@ -133,7 +170,8 @@ class AscendDFlashSpeculator(LmheadTPDraftSamplingMixin, DFlashSpeculator):
 
         self.attn_backends = attn_backends
         dflash_speculator.prepare_dflash_inputs = prepare_dflash_inputs_factory(
-            self.vllm_config.cache_config.block_size
+            self.vllm_config.cache_config.block_size,
+            _padded_block_tokens(kv_cache_config, self.draft_kv_cache_group_id),
         )
 
     def propose(
@@ -216,7 +254,20 @@ def prepare_dflash_inputs(
     sample_from_anchor: bool = False,
     *,
     kv_cache_block_size: int,
+    padded_block_tokens: int | None = None,
 ) -> None:
+    if padded_block_tokens is None or padded_block_tokens == kv_cache_block_size:
+        # Dense KV cache: physical stride equals the kernel block size.
+        slot_block_stride = block_size
+    else:
+        num_kernel_blocks = kv_cache_block_size // block_size
+        if padded_block_tokens % num_kernel_blocks:
+            raise ValueError(
+                f"Hybrid-pool padded block ({padded_block_tokens} tokens) does not "
+                f"split evenly across {num_kernel_blocks} kernel blocks; DFlash "
+                "cannot express the physical stride in slot space."
+            )
+        slot_block_stride = padded_block_tokens // num_kernel_blocks
     prepare_dflash_inputs_triton(
         input_buffers,
         query_slot_mapping,
@@ -247,4 +298,5 @@ def prepare_dflash_inputs(
         max_model_len,
         sample_from_anchor,
         kv_cache_block_size=kv_cache_block_size,
+        slot_block_stride=slot_block_stride,
     )

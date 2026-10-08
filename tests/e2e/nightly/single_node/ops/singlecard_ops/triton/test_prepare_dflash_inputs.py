@@ -212,6 +212,24 @@ ACCURACY_CASES = [
         "parallel_drafting_token_id": 782,
     },
     {
+        # Hybrid-pool padding (#14340): each 384-token physical block is padded
+        # to 432 tokens, so consecutive 128-token kernel blocks sit 144 tokens
+        # apart in the cache instead of 128.
+        "name": "padded_noncontiguous_slots",
+        "req_lens": [8],
+        "position_starts": [381],
+        "idx_mapping": [0],
+        "max_num_reqs": 2,
+        "max_num_tokens": 32,
+        "max_model_len": 8192,
+        "block_size": 128,
+        "kv_cache_block_size": 384,
+        "slot_block_stride": 144,
+        "num_query_per_req": 5,
+        "num_speculative_steps": 4,
+        "parallel_drafting_token_id": 783,
+    },
+    {
         # Crosses both QUERY_BLOCK_SIZE=16 and SAMPLE_BLOCK_SIZE=16.
         "name": "query_sample_tile_boundary",
         "req_lens": [2] * 32,
@@ -269,7 +287,16 @@ def _build_positions(req_lens, position_starts):
     return values
 
 
-def _local_slot(position, block_table_row, kv_cache_block_size, block_size, cp_rank, cp_size, cp_interleave):
+def _local_slot(
+    position,
+    block_table_row,
+    kv_cache_block_size,
+    block_size,
+    cp_rank,
+    cp_size,
+    cp_interleave,
+    slot_block_stride=None,
+):
     if cp_size == 1:
         local_position = position
     else:
@@ -284,7 +311,10 @@ def _local_slot(position, block_table_row, kv_cache_block_size, block_size, cp_r
     kernel_block = block_table_row[block_idx]
     if kernel_block == 0:
         return PAD_SLOT_ID
-    return kernel_block * block_size + local_position % block_size
+    # slot_block_stride exceeds block_size when hybrid-pool padding makes the
+    # physical KV cache non-contiguous; dense caches pass None.
+    stride = block_size if slot_block_stride is None else slot_block_stride
+    return kernel_block * stride + local_position % block_size
 
 
 def _allocate_outputs(max_num_reqs, max_num_tokens, num_speculative_steps, device):
@@ -389,6 +419,7 @@ def _build_reference(data, case):
     num_speculative_steps = case["num_speculative_steps"]
     block_size = case["block_size"]
     kv_cache_block_size = case.get("kv_cache_block_size", block_size)
+    slot_block_stride = case.get("slot_block_stride")
     cp_rank = case.get("cp_rank", 0)
     cp_size = case.get("cp_size", 1)
     cp_interleave = case.get("cp_interleave", 1)
@@ -439,7 +470,14 @@ def _build_reference(data, case):
             ctx_pos = positions[ctx_idx]
             ref.context_positions[ctx_idx] = ctx_pos
             ref.context_slot_mapping[ctx_idx] = _local_slot(
-                ctx_pos, block_table[req_idx], kv_cache_block_size, block_size, cp_rank, cp_size, cp_interleave
+                ctx_pos,
+                block_table[req_idx],
+                kv_cache_block_size,
+                block_size,
+                cp_rank,
+                cp_size,
+                cp_interleave,
+                slot_block_stride,
             )
 
         query_base = req_idx * num_query_per_req
@@ -454,7 +492,14 @@ def _build_reference(data, case):
             ref.input_ids[query_idx] = bonus_token if query_off == 0 else case["parallel_drafting_token_id"]
             ref.query_positions[query_idx] = min(query_pos, max_model_len - 1)
             ref.query_slot_mapping[query_idx] = _local_slot(
-                query_pos, block_table[req_idx], kv_cache_block_size, block_size, cp_rank, cp_size, cp_interleave
+                query_pos,
+                block_table[req_idx],
+                kv_cache_block_size,
+                block_size,
+                cp_rank,
+                cp_size,
+                cp_interleave,
+                slot_block_stride,
             )
 
         for sample_local in range(num_speculative_steps):
@@ -557,7 +602,9 @@ def _cleanup():
 def _run_case(case):
     data = _build_inputs(case, "npu")
     prepare_dflash_inputs_triton(
-        *_impl_args(data, case), kv_cache_block_size=case.get("kv_cache_block_size", case["block_size"])
+        *_impl_args(data, case),
+        kv_cache_block_size=case.get("kv_cache_block_size", case["block_size"]),
+        slot_block_stride=case.get("slot_block_stride"),
     )
     _validate_outputs(data, case, _build_reference(data, case))
     _cleanup()
@@ -589,5 +636,15 @@ def test_prepare_dflash_inputs_wrapper_forwards_dcp():
     case = next(case for case in ACCURACY_CASES if case["name"] == "dcp_physical384_kernel128")
     data = _build_inputs(case, "npu")
     prepare_dflash_inputs(*_impl_args(data, case), kv_cache_block_size=case["kv_cache_block_size"])
+    _validate_outputs(data, case, _build_reference(data, case))
+    _cleanup()
+
+
+def test_prepare_dflash_inputs_wrapper_forwards_padded_stride():
+    case = next(case for case in ACCURACY_CASES if case["name"] == "padded_noncontiguous_slots")
+    data = _build_inputs(case, "npu")
+    # kv_cache_block_size=384 with block_size=128 gives 3 kernel blocks per
+    # physical block; 432 padded tokens map to a slot stride of 144.
+    prepare_dflash_inputs(*_impl_args(data, case), kv_cache_block_size=384, padded_block_tokens=432)
     _validate_outputs(data, case, _build_reference(data, case))
     _cleanup()

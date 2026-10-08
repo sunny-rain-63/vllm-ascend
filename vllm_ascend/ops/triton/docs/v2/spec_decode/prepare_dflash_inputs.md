@@ -61,6 +61,13 @@
 > The wrapper forwards `cp_rank`, `cp_size`, and `cp_interleave` to the optimized
 > kernel and binds `kv_cache_block_size` from the configured KV cache. DCP
 > ownership uses the physical block size; block-table lookup uses `block_size`.
+> When the hybrid Attention/Mamba pool pads physical KV pages (non-contiguous
+> KV cache), the wrapper additionally binds `padded_block_tokens`, and slot
+> ids use the padded physical stride:
+> `slot = kernel_block * slot_block_stride + local_position % block_size` with
+> `slot_block_stride = padded_block_tokens / (kv_cache_block_size / block_size)`.
+> Dense caches leave `slot_block_stride == block_size`, preserving the legacy
+> addressing.
 
 | Parameter | Input/Output/Attribute | Description | Data type | Data format |
 | --- | --- | --- | --- | --- |
