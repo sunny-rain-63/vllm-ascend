@@ -73,11 +73,19 @@ def pack_spec_inputs_kernel(
     state_stride: tl.int64,
     table_row_stride,
     table_col_stride,
-    Q_STRIDES: tl.constexpr,
-    K_STRIDES: tl.constexpr,
-    V_STRIDES: tl.constexpr,
-    G_STRIDES: tl.constexpr,
-    B_STRIDES: tl.constexpr,
+    Q_TOKEN_STRIDE: tl.constexpr,
+    Q_HEAD_STRIDE: tl.constexpr,
+    Q_DIM_STRIDE: tl.constexpr,
+    K_TOKEN_STRIDE: tl.constexpr,
+    K_HEAD_STRIDE: tl.constexpr,
+    K_DIM_STRIDE: tl.constexpr,
+    V_TOKEN_STRIDE: tl.constexpr,
+    V_HEAD_STRIDE: tl.constexpr,
+    V_DIM_STRIDE: tl.constexpr,
+    G_TOKEN_STRIDE: tl.constexpr,
+    G_HEAD_STRIDE: tl.constexpr,
+    B_TOKEN_STRIDE: tl.constexpr,
+    B_HEAD_STRIDE: tl.constexpr,
     WIDTH: tl.constexpr,
     Q_SIZE: tl.constexpr,
     V_SIZE: tl.constexpr,
@@ -96,25 +104,25 @@ def pack_spec_inputs_kernel(
         packed_token = tl.load(packed_starts + req).to(tl.int64) + col
         offsets = tile * BLOCK + tl.arange(0, BLOCK)
         q = tl.load(
-            query + token * Q_STRIDES[0] + offsets // K_DIM * Q_STRIDES[1] + offsets % K_DIM * Q_STRIDES[2],
+            query + token * Q_TOKEN_STRIDE + offsets // K_DIM * Q_HEAD_STRIDE + offsets % K_DIM * Q_DIM_STRIDE,
             offsets < Q_SIZE,
             other=0,
         )
         k = tl.load(
-            key + token * K_STRIDES[0] + offsets // K_DIM * K_STRIDES[1] + offsets % K_DIM * K_STRIDES[2],
+            key + token * K_TOKEN_STRIDE + offsets // K_DIM * K_HEAD_STRIDE + offsets % K_DIM * K_DIM_STRIDE,
             offsets < Q_SIZE,
             other=0,
         )
         v = tl.load(
-            value + token * V_STRIDES[0] + offsets // V_DIM * V_STRIDES[1] + offsets % V_DIM * V_STRIDES[2],
+            value + token * V_TOKEN_STRIDE + offsets // V_DIM * V_HEAD_STRIDE + offsets % V_DIM * V_DIM_STRIDE,
             offsets < V_SIZE,
             other=0,
         )
         tl.store(packed_query + packed_token * Q_SIZE + offsets, q, offsets < Q_SIZE)
         tl.store(packed_key + packed_token * Q_SIZE + offsets, k, offsets < Q_SIZE)
         tl.store(packed_value + packed_token * V_SIZE + offsets, v, offsets < V_SIZE)
-        gate = tl.load(g + token * G_STRIDES[0] + offsets * G_STRIDES[1], offsets < VALUE_HEADS, other=0)
-        b = tl.load(beta + token * B_STRIDES[0] + offsets * B_STRIDES[1], offsets < VALUE_HEADS, other=0)
+        gate = tl.load(g + token * G_TOKEN_STRIDE + offsets * G_HEAD_STRIDE, offsets < VALUE_HEADS, other=0)
+        b = tl.load(beta + token * B_TOKEN_STRIDE + offsets * B_HEAD_STRIDE, offsets < VALUE_HEADS, other=0)
         tl.store(packed_g + packed_token * VALUE_HEADS + offsets, gate, offsets < VALUE_HEADS)
         tl.store(packed_beta + packed_token * VALUE_HEADS + offsets, b, offsets < VALUE_HEADS)
         if tile == 0:

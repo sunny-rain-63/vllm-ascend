@@ -57,6 +57,8 @@ def test_fla_directly_updates_original_cache_without_state_workspace(monkeypatch
     inputs = make_inputs(padding, index_stride)
     for name in ("query", "key", "value", "beta"):
         inputs[name] = inputs[name].to(torch.bfloat16)
+    for name in ("query", "key", "value", "g", "beta"):
+        inputs[name] = inputs[name].repeat_interleave(2, dim=-1)[..., ::2]
     metadata, pack, unpack, fallback = MagicMock(), MagicMock(), MagicMock(), MagicMock()
     fused = MagicMock(return_value=torch.empty_like(inputs["value"]))
     allocations = MagicMock(wraps=torch.empty)
@@ -72,6 +74,18 @@ def test_fla_directly_updates_original_cache_without_state_workspace(monkeypatch
     assert fused.call_args.args[3] is inputs["state"]
     assert pack.__getitem__.return_value.call_args.args[5] is inputs["state"]
     assert pack.__getitem__.return_value.call_args.args[17] == inputs["state"].stride(0)
+    pack_kwargs = pack.__getitem__.return_value.call_args.kwargs
+    for prefix, name, axes in (
+        ("Q", "query", ("TOKEN", "HEAD", "DIM")),
+        ("K", "key", ("TOKEN", "HEAD", "DIM")),
+        ("V", "value", ("TOKEN", "HEAD", "DIM")),
+        ("G", "g", ("TOKEN", "HEAD")),
+        ("B", "beta", ("TOKEN", "HEAD")),
+    ):
+        # Ascend Triton cannot subscript a tuple wrapped in tl.constexpr.
+        strides = tuple(pack_kwargs[f"{prefix}_{axis}_STRIDE"] for axis in axes)
+        assert all(isinstance(stride, int) for stride in strides)
+        assert strides == inputs[name].stride()
     assert fused.call_args.kwargs["num_accepted_tokens"] is metadata.__getitem__.return_value.call_args.args[5]
     assert fused.call_args.kwargs["ssm_state_indices"] is pack.__getitem__.return_value.call_args.args[16]
     assert unpack.__getitem__.return_value.call_args.args[0] is fused.return_value

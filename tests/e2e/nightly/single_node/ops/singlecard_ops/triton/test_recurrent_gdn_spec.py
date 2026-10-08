@@ -81,7 +81,7 @@ def test_spec_recurrence_preserves_rows_and_padding(lengths, padding, dtype, gra
     starts = torch.tensor([0, *torch.tensor(lengths).cumsum(0).tolist()], dtype=torch.int32, device=device)
     accepted = torch.tensor([8, 5, 1], dtype=torch.int32, device=device)
     query = torch.empty(tokens, heads, key_dim * input_stride, dtype=dtype, device=device)[..., ::input_stride]
-    key = torch.empty_like(query)
+    key = torch.empty(tokens, heads, key_dim * input_stride, dtype=dtype, device=device)[..., ::input_stride]
     value = torch.empty(tokens, value_heads, value_dim * input_stride, dtype=dtype, device=device)[..., ::input_stride]
     g = torch.empty(tokens, value_heads * input_stride, dtype=torch.float32, device=device)[:, ::input_stride]
     beta = torch.empty(tokens, value_heads * input_stride, dtype=dtype, device=device)[:, ::input_stride]
