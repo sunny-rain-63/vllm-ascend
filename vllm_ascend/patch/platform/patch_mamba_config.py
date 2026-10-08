@@ -66,6 +66,19 @@ def verify_and_update_config(cls, vllm_config) -> None:
     Args:
         vllm_config: vLLM configuration.
     """
+    # DFlash speculative decoding writes and reads the draft/target KV cache
+    # with kernels and CANN paged-attention operators that assume a dense,
+    # contiguous page layout. The non-contiguous (page_size_padded) layout
+    # introduced by PR #14340 breaks that assumption: the acceptance length
+    # collapses to 1 after a few decode steps and inference stalls. Keep the
+    # pre-#14340 dense layout (attention page == mamba page) for DFlash runs.
+    spec_config = vllm_config.speculative_config
+    if spec_config is not None and getattr(spec_config, "method", None) in ("dflash", "dflash2"):
+        logger.info(
+            "DFlash speculative decoding requires contiguous KV cache pages; "
+            "falling back to the dense pre-#14340 cache layout."
+        )
+        return _legacy_verify_and_update_config(vllm_config)
     using_kv_store_with_hybrid = not vllm_config.scheduler_config.disable_hybrid_kv_cache_manager and _using_kv_store(
         vllm_config
     )
@@ -152,6 +165,166 @@ def verify_and_update_config(cls, vllm_config) -> None:
                 "Padding mamba page size by %.2f%% to align the sparse indexer and recurrent-state cache pages.",
                 mamba_padding_pct,
             )
+    # The extract_hidden_states connector (ExampleHiddenStatesConnector) only
+    # manages the dedicated hidden-state cache-only layer; it does not migrate
+    # mamba KV blocks across instances, so it does not require the block-aligned
+    # mamba cache mode. Forcing "align" for it would route hybrid models onto
+    # vLLM's fused GPU postprocess Triton kernel (introduced in vLLM #40172),
+    # which the Ascend Triton backend cannot compile. Leave the mode as vLLM
+    # derived it (e.g. "none" when prefix caching is off) for this case.
+    spec_config = vllm_config.speculative_config
+    is_extract_hidden_states = (
+        spec_config is not None and getattr(spec_config, "method", None) == "extract_hidden_states"
+    )
+    if using_kv_store_with_hybrid and not is_extract_hidden_states:
+        if cache_config.mamba_cache_mode == "none":
+            cache_config.mamba_cache_mode = "align"
+        else:
+            assert cache_config.mamba_cache_mode == "align", (
+                "mamba_cache_mode only support 'align' when kv_transfer enabled now!"
+            )
+    if cache_config.enable_prefix_caching and cache_config.mamba_cache_mode == "align":
+        cache_config.mamba_block_size = cache_config.block_size
+    else:
+        cache_config.mamba_block_size = model_config.max_model_len
+
+
+def _legacy_verify_and_update_config(vllm_config) -> None:
+    """Pre-#14340 dense cache layout, kept for DFlash speculative decoding.
+
+    Force the attention page size and the mamba page size to be exactly
+    equal so that every KV cache tensor stays physically contiguous, which
+    the DFlash draft kernels and the CANN paged-attention operator rely on.
+    """
+    using_kv_store_with_hybrid = not vllm_config.scheduler_config.disable_hybrid_kv_cache_manager and _using_kv_store(
+        vllm_config
+    )
+    logger.debug("Using kv store: %s", using_kv_store_with_hybrid)
+    # Enable FULL_AND_PIECEWISE by default
+    MambaModelConfig.verify_and_update_config(vllm_config)
+
+    cache_config = vllm_config.cache_config
+    model_config = vllm_config.model_config
+    parallel_config = vllm_config.parallel_config
+
+    if cache_config.cache_dtype == "auto":
+        kv_cache_dtype = model_config.dtype
+    else:
+        kv_cache_dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_config.cache_dtype]
+
+    kernel_block_size = 128
+    model_cls, _ = ModelRegistry.resolve_model_cls(
+        model_config.architecture,
+        model_config=model_config,
+    )
+
+    # get mamba block size
+    mamba_shapes = model_cls.get_mamba_state_shape_from_config(vllm_config)
+    mamba_dtypes = model_cls.get_mamba_state_dtype_from_config(vllm_config)
+    mamba_sizes = []
+    for shape, dtype in zip(mamba_shapes, mamba_dtypes):
+        mamba_sizes.append(math.prod(shape) * get_dtype_size(dtype))
+    ssm_block_page_size, conv_block_page_size = max(mamba_sizes), min(mamba_sizes)
+    mamba_raw_page_size = sum(mamba_sizes)
+
+    # Pure linear attention models (e.g. bailing 2.5) have only SSM state,
+    # no conv block. Detected by a single 3-D mamba shape (ssm only, no conv).
+    # Example shape: MambaSpec(shapes=((8, 128, 128),), mamba_type='linear_attention')
+    if len(mamba_shapes) == 1 and len(mamba_shapes[0]) == 3:
+        conv_block_page_size = 0
+
+    # NOTE(zxr): because of the limit of Ascend Hardware, we need to keep
+    # all cache tensors contiguous, so we align the page size of ssm_block
+    # and single attn_block
+    if model_config.use_mla:
+        attn_num_kv_heads = model_config.get_num_kv_heads(parallel_config)
+        kv_lora_rank = model_config.hf_text_config.kv_lora_rank
+        qk_rope_head_dim = model_config.hf_text_config.qk_rope_head_dim
+        attn_single_token_k_page_size = kv_lora_rank * attn_num_kv_heads * get_dtype_size(kv_cache_dtype)
+        attn_rope_token_page_size = qk_rope_head_dim * attn_num_kv_heads * get_dtype_size(kv_cache_dtype)
+        attn_token_page_size = attn_single_token_k_page_size + attn_rope_token_page_size
+    else:
+        attn_num_kv_heads = model_config.get_num_kv_heads(parallel_config)
+        attn_head_size = model_config.get_head_size()
+        attn_single_token_k_page_size = attn_head_size * attn_num_kv_heads * get_dtype_size(kv_cache_dtype)
+        attn_token_page_size = 2 * attn_head_size * attn_num_kv_heads * get_dtype_size(kv_cache_dtype)
+
+    index_kpool = _get_sparse_index_kpool(model_config)
+    if index_kpool is not None:
+        sfa_c8_packed = model_config.use_mla and _using_sparse_sfa_c8(vllm_config, model_config)
+        if sfa_c8_packed:
+            # A C8-packed SFA page holds one token in kv_lora_rank int8 bytes
+            # plus fp32 scale metadata, roughly half the bf16 page. Size the
+            # shared mamba page from the packed page, otherwise it stays at
+            # bf16 geometry and the C8 capacity gain is lost to padding.
+            from vllm_ascend.attention.utils import get_sfa_qsfa_packed_head_dim
+
+            attn_token_page_size = get_sfa_qsfa_packed_head_dim(
+                model_config.hf_text_config.kv_lora_rank,
+                model_config.hf_text_config.qk_rope_head_dim,
+            )
+        # The compressed indexer storage block is consumed by a CANN kernel
+        # whose block size must be a multiple of 16. Keep the scheduler block
+        # C128-aligned while making block_size / index_kpool C16-aligned too.
+        alignment_tokens = math.lcm(kernel_block_size, index_kpool * 16)
+        min_block_size = cdiv(mamba_raw_page_size, attn_token_page_size)
+        requested_block_size = cache_config.block_size or kernel_block_size
+        attn_block_size = alignment_tokens * cdiv(max(requested_block_size, min_block_size), alignment_tokens)
+        if sfa_c8_packed:
+            # The packed C8 page must cover the mamba state page, otherwise
+            # the page-strided KV view gains a per-block hole and the CANN
+            # operator's AutoContiguous copies the whole KV pool once per
+            # layer per decode step. The covering size is what the alignment
+            # formula derives from min_block_size alone (544 -> 640 for
+            # GLM-5.3-Flash); cap larger requests at it, since they only
+            # coarsen scheduling granularity without adding coverage.
+            c8_block_size = alignment_tokens * cdiv(min_block_size, alignment_tokens)
+            attn_block_size = min(attn_block_size, c8_block_size)
+        if cache_config.block_size != attn_block_size:
+            cache_config.block_size = attn_block_size
+            logger.info(
+                "Setting attention block size to %d tokens to align MLA, "
+                "recurrent-state, and compressed indexer cache pages.",
+                attn_block_size,
+            )
+    else:
+        attn_block_size = kernel_block_size * cdiv(
+            ssm_block_page_size,
+            kernel_block_size * attn_single_token_k_page_size,
+        )
+        assert attn_single_token_k_page_size * attn_block_size == ssm_block_page_size, (
+            "Cannot align ssm_page_size and attn_page_size."
+        )
+
+        # Override attention block size if it is unset or too small.
+        if cache_config.block_size is None or cache_config.block_size < attn_block_size:
+            cache_config.block_size = attn_block_size
+            logger.info(
+                "Setting attention block size to %d tokens to ensure that attention page size is >= mamba page size.",
+                attn_block_size,
+            )
+
+    # compute new attention page size
+    attn_page_size = cache_config.block_size * attn_token_page_size
+
+    # Sparse index-kpool models pack the complete recurrent state into the
+    # same large-page class as attention. Preserve the generic Ascend SSM+conv
+    # layout for other hybrid models.
+    target_mamba_page_size = (
+        max(attn_page_size, mamba_raw_page_size) if index_kpool is not None else attn_page_size + conv_block_page_size
+    )
+    if cache_config.mamba_page_size_padded is None or cache_config.mamba_page_size_padded != target_mamba_page_size:
+        cache_config.mamba_page_size_padded = target_mamba_page_size
+        padding_bytes = (
+            target_mamba_page_size - mamba_raw_page_size if index_kpool is not None else conv_block_page_size
+        )
+        mamba_padding_pct = 100 * padding_bytes / target_mamba_page_size
+        logger.info(
+            "Padding mamba page size by %.2f%% to ensure "
+            "that mamba page size and attention page size are "
+            "exactly equal.",
+            mamba_padding_pct,
+        )
     # The extract_hidden_states connector (ExampleHiddenStatesConnector) only
     # manages the dedicated hidden-state cache-only layer; it does not migrate
     # mamba KV blocks across instances, so it does not require the block-aligned
