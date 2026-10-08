@@ -32,6 +32,7 @@ def _make_impl(impl_cls=AscendAttentionBackendImpl):
     impl.enable_c8_quant = False
     impl._use_max_workspace_for_fia_graph = False
     impl._layer_name = "layer"
+    impl.vllm_config = SimpleNamespace(speculative_config=None)
     return impl
 
 
@@ -150,6 +151,52 @@ def test_forward_non_pa_branches_receive_contiguous_kv(branch, contiguous, cross
         assert (kwargs[name].data_ptr() == original.data_ptr()) == contiguous
     assert result is output
     torch.testing.assert_close(output, torch.ones_like(query))
+
+
+@pytest.mark.parametrize("method", [None, "mtp", "dflash"])
+@pytest.mark.parametrize("branch", ["causal", "non_causal", "sliding_window"])
+@pytest.mark.parametrize("use_bnsd", [False, True])
+def test_eager_dflash_stages_cache_reads_without_rebinding_writes(method, branch, use_bnsd):
+    impl = _make_impl()
+    impl.vllm_config.speculative_config = SimpleNamespace(method=method) if method else None
+    impl.use_bnsd_kv_cache = use_bnsd
+    impl.sliding_window = 16 if branch == "sliding_window" else None
+    shape = (2, 2, 1, 3, 4) if use_bnsd else (2, 2, 3, 1, 4)
+    backing = torch.arange(48, dtype=torch.float32).view(shape)
+    original_key, original_value = backing[:, 0], backing[:, 1]
+    impl.key_cache, impl.value_cache = original_key, original_value
+    metadata = _make_metadata(AscendAttentionState.SpecDecoding)
+    metadata.causal = branch != "non_causal"
+    query = torch.zeros(3, 2, 4)
+    output = torch.empty_like(query)
+
+    with (
+        patch.object(attn_module, "_EXTRA_CTX", SimpleNamespace(capturing=False)),
+        patch.object(attn_module.envs_vllm, "VLLM_BATCH_INVARIANT", False),
+        patch.object(attn_module, "get_current_hardware_profile", return_value=Mock(supports=lambda _: False)),
+        patch.object(attn_module.torch_npu, "npu_fused_infer_attention_score", create=True) as direct_fia,
+        patch.object(attn_module.DeviceOperator, "npu_fused_infer_attention_score") as device_fia,
+    ):
+        selected_fia = device_fia if branch == "causal" else direct_fia
+        selected_fia.return_value = (torch.ones_like(query), None)
+        for step in range(2):
+            if step:
+                # A later decode step must observe writes to the original cache.
+                original_key[1].add_(100)
+                original_value[1].sub_(100)
+            before = backing.clone()
+            impl.forward_fused_infer_attention(query, _strided_kv(), _strided_kv(), metadata, output)
+            kwargs = selected_fia.call_args.kwargs
+            assert kwargs["block_table"] is metadata.block_tables
+            assert kwargs["block_size"] == 3
+            assert impl.key_cache is original_key
+            assert impl.value_cache is original_value
+            torch.testing.assert_close(backing, before)
+            for name, original in (("key", original_key), ("value", original_value)):
+                actual = kwargs[name]
+                torch.testing.assert_close(actual.reshape(original.shape), original)
+                assert actual.is_contiguous() == (method == "dflash")
+                assert (actual.data_ptr() == original.data_ptr()) == (method != "dflash")
 
 
 @pytest.mark.parametrize("v2", [False, True])
