@@ -205,7 +205,7 @@ def test_main_allocator_attention_layout(
     assert second_key.shape == expected_shape
     assert second_value.shape == expected_shape
     block_elements = kernel_block_size * spec.num_kv_heads * spec.head_size
-    if cache_kind in ("c8", "dcp") or (cache_kind in ("full", "mixed") and not pa_enabled):
+    if cache_kind in ("c8", "dcp", "sliding_window") or (cache_kind in ("full", "mixed") and not pa_enabled):
         assert not key_cache.is_contiguous()
         assert not value_cache.is_contiguous()
         assert key_cache.stride(0) == value_cache.stride(0) == 2 * block_elements
@@ -283,9 +283,12 @@ def test_hybrid_allocator_keeps_shared_backing_with_pa_configured(monkeypatch, p
     assert raw_caches[attn_name].data_ptr() == raw_caches[mamba_name].data_ptr()
 
 
-def test_hybrid_attention_layout_preserves_padding(monkeypatch):
+@pytest.mark.parametrize("sliding_window", [False, True])
+def test_hybrid_attention_layout_preserves_padding(monkeypatch, sliding_window):
     name = "model.layers.0.self_attn.attn"
-    spec = FullAttentionSpec(block_size=2, num_kv_heads=1, head_size=4, dtype=torch.float16, page_size_padded=64)
+    spec_cls = SlidingWindowSpec if sliding_window else FullAttentionSpec
+    kwargs = {"sliding_window": 16} if sliding_window else {}
+    spec = spec_cls(block_size=2, num_kv_heads=1, head_size=4, dtype=torch.float16, page_size_padded=64, **kwargs)
     config = KVCacheConfig(
         num_blocks=3,
         kv_cache_tensors=[],
@@ -324,9 +327,12 @@ def test_hybrid_attention_layout_preserves_padding(monkeypatch):
 
 
 @pytest.mark.parametrize("sparse_backend", [False, True])
-def test_padded_full_attention_allocation_preserves_backend_behavior(monkeypatch, sparse_backend):
+@pytest.mark.parametrize("sliding_window", [False, True])
+def test_padded_attention_allocation_preserves_backend_behavior(monkeypatch, sparse_backend, sliding_window):
     name = "model.layers.0.self_attn.attn"
-    spec = FullAttentionSpec(block_size=2, num_kv_heads=1, head_size=4, dtype=torch.float16, page_size_padded=64)
+    spec_cls = SlidingWindowSpec if sliding_window else FullAttentionSpec
+    kwargs = {"sliding_window": 16} if sliding_window else {}
+    spec = spec_cls(block_size=2, num_kv_heads=1, head_size=4, dtype=torch.float16, page_size_padded=64, **kwargs)
     config = KVCacheConfig(
         num_blocks=3,
         kv_cache_tensors=[
@@ -360,7 +366,7 @@ def test_padded_full_attention_allocation_preserves_backend_behavior(monkeypatch
     monkeypatch.setattr(attn_utils, "enable_sfa", lambda *_args: False)
     monkeypatch.setattr(attn_utils, "enable_fa_quant", lambda *_args: False)
     if sparse_backend:
-        with pytest.raises(ValueError, match="unpadded FullAttention pages"):
+        with pytest.raises(ValueError, match="unpadded Attention pages"):
             attn_utils._allocate_kv_cache(config, shared_layers={}, device=torch.device("cpu"))
     else:
         raw_caches = attn_utils._allocate_kv_cache(config, shared_layers={}, device=torch.device("cpu"))
@@ -408,7 +414,7 @@ def test_mrv2_attention_views_interleave_kv_per_physical_page():
         dtype=torch.int8,
     )
 
-    key, value = attn_utils._reshape_combined_attention_kv_cache(
+    key, value = attn_utils.reshape_paged_attention_kv_cache(
         raw,
         (2, num_blocks, block_size, num_heads, head_size),
         torch.float16,
@@ -951,7 +957,7 @@ def test_combined_attention_kernel_blocks_match_physical_rows(splits):
     shape = (2, 3 * splits, 128, 2, 256)
     block_elements = 128 * 2 * 256
     raw = torch.zeros(2 * shape[1] * block_elements, dtype=torch.float16)
-    key, value = attn_utils._reshape_combined_attention_kv_cache(
+    key, value = attn_utils.reshape_paged_attention_kv_cache(
         raw.view(torch.int8), shape, raw.dtype, splits * 2 * block_elements * 2, splits
     )
     physical = raw.view(3, splits, 2, 128, 2, 256)
@@ -964,7 +970,7 @@ def test_combined_attention_kernel_blocks_match_physical_rows(splits):
     assert key.stride(0) == 2 * block_elements
     assert key.untyped_storage().data_ptr() == raw.untyped_storage().data_ptr()
     with pytest.raises(ValueError, match="Padded combined"):
-        attn_utils._reshape_combined_attention_kv_cache(
+        attn_utils.reshape_paged_attention_kv_cache(
             raw.view(torch.int8), shape, raw.dtype, 9 * 2 * block_elements * 2 + 64, 9
         )
 
@@ -979,7 +985,7 @@ def test_padded_attention_kernel_writes_preserve_other_pages_and_padding(splits,
     kernel_stride_elements = page_bytes // splits // dtype_size
     raw = torch.full((num_blocks, splits, kernel_stride_elements), -7, dtype=dtype)
     shape = (2, num_blocks * splits, block_size, heads, dim)
-    key, value = attn_utils._reshape_combined_attention_kv_cache(
+    key, value = attn_utils.reshape_paged_attention_kv_cache(
         raw.view(torch.int8).flatten(), shape, dtype, page_bytes, splits
     )
     assert key.untyped_storage().data_ptr() == raw.untyped_storage().data_ptr()
@@ -1008,7 +1014,7 @@ def test_padded_attention_kernel_writes_preserve_other_pages_and_padding(splits,
 def test_combined_attention_rejects_invalid_kernel_page_geometry(splits, page_bytes, message):
     raw = torch.zeros(4096, dtype=torch.int8)
     with pytest.raises(ValueError, match=message):
-        attn_utils._reshape_combined_attention_kv_cache(raw, (2, 4, 128, 1, 1), torch.float16, page_bytes, splits)
+        attn_utils.reshape_paged_attention_kv_cache(raw, (2, 4, 128, 1, 1), torch.float16, page_bytes, splits)
 
 
 @pytest.mark.parametrize("for_capture", [False, True])
