@@ -54,6 +54,7 @@ def _dflash_local_slot(
     block_size,
     cp_rank,
     KV_CACHE_BLOCK_SIZE: tl.constexpr,
+    SLOT_BLOCK_STRIDE: tl.constexpr,
     CP_SIZE: tl.constexpr,
     CP_INTERLEAVE: tl.constexpr,
     PAD_SLOT_ID: tl.constexpr,
@@ -78,7 +79,10 @@ def _dflash_local_slot(
         mask=valid & is_local,
         other=0,
     ).to(tl.int64)
-    slot = block_numbers * block_size + local_positions % block_size
+    # SLOT_BLOCK_STRIDE is the physical token stride between consecutive kernel
+    # blocks. It exceeds block_size when hybrid-pool padding makes the KV cache
+    # non-contiguous (#14340); both are equal for dense caches.
+    slot = block_numbers * SLOT_BLOCK_STRIDE + local_positions % block_size
     return tl.where(valid & is_local & (block_numbers != 0), slot, PAD_SLOT_ID)
 
 
@@ -121,6 +125,7 @@ def _prepare_dflash_inputs_kernel(
     max_model_len,
     cp_rank,
     KV_CACHE_BLOCK_SIZE: tl.constexpr,
+    SLOT_BLOCK_STRIDE: tl.constexpr,
     SAMPLE_FROM_ANCHOR: tl.constexpr,
     PAD_SLOT_ID: tl.constexpr,
     CP_SIZE: tl.constexpr,
@@ -167,6 +172,7 @@ def _prepare_dflash_inputs_kernel(
         block_size,
         cp_rank,
         KV_CACHE_BLOCK_SIZE,
+        SLOT_BLOCK_STRIDE,
         CP_SIZE,
         CP_INTERLEAVE,
         PAD_SLOT_ID,
@@ -213,6 +219,7 @@ def _prepare_dflash_inputs_kernel(
         block_size,
         cp_rank,
         KV_CACHE_BLOCK_SIZE,
+        SLOT_BLOCK_STRIDE,
         CP_SIZE,
         CP_INTERLEAVE,
         PAD_SLOT_ID,
@@ -328,6 +335,7 @@ def prepare_dflash_inputs_triton(
     sample_from_anchor: bool = False,
     *,
     kv_cache_block_size: int,
+    slot_block_stride: int | None = None,
 ) -> None:
     """Prepare DFlash inputs and KV slot mappings for a draft step.
 
@@ -337,9 +345,18 @@ def prepare_dflash_inputs_triton(
             ownership and convert global positions to rank-local positions.
             One physical block may span multiple kernel blocks; its size must
             be divisible by ``block_size`` (for example, 384 versus 128).
+        slot_block_stride: Physical token stride between consecutive kernel
+            blocks in the KV cache. Hybrid-pool padding (#14340) makes the
+            cache non-contiguous, so this stride exceeds ``block_size``; the
+            default ``None`` keeps the dense layout (stride == ``block_size``).
     """
     num_reqs = input_batch.num_reqs
     assert num_reqs > 0
+
+    if slot_block_stride is None:
+        slot_block_stride = block_size
+    if slot_block_stride < block_size:
+        raise ValueError("The slot block stride must be at least the kernel block size.")
 
     max_target_query_len = int(input_batch.num_scheduled_tokens.max())
 
@@ -399,6 +416,7 @@ def prepare_dflash_inputs_triton(
         max_model_len,
         cp_rank,
         KV_CACHE_BLOCK_SIZE=kv_cache_block_size,
+        SLOT_BLOCK_STRIDE=slot_block_stride,
         SAMPLE_FROM_ANCHOR=sample_from_anchor,
         PAD_SLOT_ID=PAD_SLOT_ID,
         CP_SIZE=cp_size,
