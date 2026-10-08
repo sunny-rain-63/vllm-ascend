@@ -53,29 +53,31 @@ def test_recurrent_launch_preserves_cache_and_request_strides(monkeypatch, paddi
 
 @pytest.mark.parametrize("padding", [0, 13])
 @pytest.mark.parametrize("index_stride", [1, 2])
-def test_fla_stages_only_batch_states_and_scatter_keeps_original_cache(monkeypatch, padding, index_stride):
+def test_fla_directly_updates_original_cache_without_state_workspace(monkeypatch, padding, index_stride):
     inputs = make_inputs(padding, index_stride)
     for name in ("query", "key", "value", "beta"):
         inputs[name] = inputs[name].to(torch.bfloat16)
-    prepare, scatter, fallback = MagicMock(), MagicMock(), MagicMock()
+    metadata, pack, unpack, fallback = MagicMock(), MagicMock(), MagicMock(), MagicMock()
     fused = MagicMock(return_value=torch.empty_like(inputs["value"]))
-    monkeypatch.setattr(recurrent_gdn, "prepare_spec_states_kernel", prepare)
-    monkeypatch.setattr(recurrent_gdn, "scatter_spec_states_kernel", scatter)
+    allocations = MagicMock(wraps=torch.empty)
+    monkeypatch.setattr(recurrent_gdn.torch, "empty", allocations)
+    monkeypatch.setattr(recurrent_gdn, "prepare_spec_metadata_kernel", metadata)
+    monkeypatch.setattr(recurrent_gdn, "pack_spec_inputs_kernel", pack)
+    monkeypatch.setattr(recurrent_gdn, "unpack_spec_output_kernel", unpack)
     monkeypatch.setattr(recurrent_gdn, "recurrent_gated_delta_rule", fused)
     monkeypatch.setattr(recurrent_gdn, "fused_recurrent_gated_delta_rule_fwd_kernel", fallback)
     output = recurrent_gdn.recurrent_gated_delta_rule_spec(**inputs)
     fused.assert_called_once()
     fallback.__getitem__.assert_not_called()
-    workspace = fused.call_args.args[3]
-    assert workspace.is_contiguous()
-    assert workspace.shape == (11, 2, 3, 4)  # 10 scheduled tokens, not 19 cache rows
-    assert workspace.untyped_storage().data_ptr() != inputs["state"].untyped_storage().data_ptr()
-    assert fused.call_args.kwargs["num_accepted_tokens"] is None
-    assert fused.call_args.kwargs["ssm_state_indices"].tolist() == list(range(1, 11))
-    assert prepare.__getitem__.return_value.call_args.args[0] is inputs["state"]
-    assert scatter.__getitem__.return_value.call_args.args[1] is inputs["state"]
-    assert scatter.__getitem__.return_value.call_args.args[6] == inputs["state"].stride(0)
-    assert output is fused.return_value
+    assert fused.call_args.args[3] is inputs["state"]
+    assert pack.__getitem__.return_value.call_args.args[5] is inputs["state"]
+    assert pack.__getitem__.return_value.call_args.args[17] == inputs["state"].stride(0)
+    assert fused.call_args.kwargs["num_accepted_tokens"] is metadata.__getitem__.return_value.call_args.args[5]
+    assert fused.call_args.kwargs["ssm_state_indices"] is pack.__getitem__.return_value.call_args.args[16]
+    assert unpack.__getitem__.return_value.call_args.args[0] is fused.return_value
+    assert unpack.__getitem__.return_value.call_args.args[1] is output
+    # Temporary allocations scale with token vectors, never K*V state rows.
+    assert all(isinstance(call.args[0], int) or len(call.args[0]) < 4 for call in allocations.call_args_list)
 
 
 def test_more_than_eight_states_keeps_verified_triton_path(monkeypatch):

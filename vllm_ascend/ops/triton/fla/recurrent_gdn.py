@@ -5,10 +5,11 @@ import torch
 from fla_npu.ops.ascendc import recurrent_gated_delta_rule
 from vllm.triton_utils import triton
 
-from vllm_ascend.ops.triton.fla.spec_state_io import (
-    SPEC_STATE_IO_BLOCK_SIZE,
-    prepare_spec_states_kernel,
-    scatter_spec_states_kernel,
+from vllm_ascend.ops.triton.fla.direct_spec_io import (
+    SPEC_TOKEN_BLOCK_SIZE,
+    pack_spec_inputs_kernel,
+    prepare_spec_metadata_kernel,
+    unpack_spec_output_kernel,
 )
 from vllm_ascend.ops.triton.kda.fused_recurrent_kda import fused_recurrent_gated_delta_rule_fwd_kernel
 
@@ -35,11 +36,12 @@ def recurrent_gated_delta_rule_spec(
     fewer tokens or accepted[r] exceeds the current query length. Flattening
     the table and indexing it by packed token offsets violates this contract.
 
-    Gather just the selected initial rows into a batch-sized dense workspace
-    for FLA, then scatter the token states back using the original page stride.
-    Neither the cache allocation nor its logical/physical page layout changes.
-    The previous Triton path remains available for shapes/dtypes outside FLA's
-    eight-token FP16/BF16 contract.
+    Requires a FLA build that supports strided recurrent state. FLA reads and
+    writes the original cache; only token inputs/outputs and metadata are
+    compacted to exclude null graph requests. No token-state workspace or
+    state scatter is needed. The scheduler must give each real request its
+    own valid live state rows. The previous Triton path remains available
+    for shapes/dtypes outside FLA's eight-token FP16/BF16 contract.
     """
     if query.ndim != 3 or query.shape != key.shape or value.ndim != 3:
         raise ValueError("Expected Q/K [tokens, heads, key_dim] and V [tokens, value_heads, value_dim].")
@@ -79,60 +81,96 @@ def recurrent_gated_delta_rule_spec(
         and state.dtype == g.dtype == torch.float32
     ):
         width = ssm_state_indices.shape[1]
-        row_size = value_heads * value_dim * key_dim
-        # Only this batch's token states are staged, never the entire cache.
-        # FLA initializes every live row, so only initial rows need gathering.
-        workspace = torch.empty((tokens + 1, *state.shape[1:]), dtype=state.dtype, device=state.device)
+        q_size, v_size = heads * key_dim, value_heads * value_dim
         lengths = torch.empty(num_reqs + 1, dtype=torch.int32, device=state.device)
-        packed_indices = torch.arange(1, tokens + 1, dtype=torch.int32, device=state.device)
-        active = torch.zeros(tokens, dtype=torch.bool, device=state.device)
+        packed_starts = torch.empty_like(lengths)
+        packed_accepted = torch.empty(num_reqs, dtype=torch.int32, device=state.device)
+        packed_indices = torch.empty(tokens, dtype=torch.int32, device=state.device)
         starts = query_start_loc.contiguous()
-        prepare_spec_states_kernel[(triton.cdiv(row_size, SPEC_STATE_IO_BLOCK_SIZE), num_reqs)](
-            state,
-            workspace,
-            ssm_state_indices,
-            num_accepted_tokens.contiguous(),
+        accepted = num_accepted_tokens.contiguous()
+        prepare_spec_metadata_kernel[(1,)](
             starts,
+            ssm_state_indices,
+            accepted,
             lengths,
-            active,
-            state.stride(0),
+            packed_starts,
+            packed_accepted,
             ssm_state_indices.stride(0),
             ssm_state_indices.stride(1),
+            NUM_REQS=num_reqs,
             NUM_STATES=state.shape[0],
             WIDTH=width,
-            ROW_SIZE=row_size,
-            BLOCK=SPEC_STATE_IO_BLOCK_SIZE,
+            REQ_BLOCK=triton.next_power_of_2(num_reqs),
+            WIDTH_BLOCK=triton.next_power_of_2(width),
         )
-        # Acceptance was resolved while gathering, not clamped to this step's
-        # query length. FLA sees a genuine packed table and needs no acceptance.
-        output = recurrent_gated_delta_rule(
+        # Pack small token tensors, not O(K*V) recurrent states. This also
+        # replaces FLA's individual contiguous copies of strided Q/K/V/g/beta.
+        packed_query = torch.empty(query.shape, dtype=query.dtype, device=query.device)
+        packed_key = torch.empty_like(packed_query)
+        packed_value = torch.empty(value.shape, dtype=value.dtype, device=value.device)
+        packed_g = torch.empty(g.shape, dtype=g.dtype, device=g.device)
+        packed_beta = torch.empty(beta.shape, dtype=beta.dtype, device=beta.device)
+        tiles = triton.cdiv(max(q_size, v_size), SPEC_TOKEN_BLOCK_SIZE)
+        pack_spec_inputs_kernel[(tiles, num_reqs * width)](
             query,
             key,
             value,
-            workspace,
-            g=g,
-            beta=beta,
-            scale=scale,
-            actual_seq_lengths=lengths,
-            ssm_state_indices=packed_indices,
-            num_accepted_tokens=None,
-        )
-        scatter_spec_states_kernel[(triton.cdiv(row_size, SPEC_STATE_IO_BLOCK_SIZE), num_reqs * width)](
-            workspace,
+            g,
+            beta,
             state,
             ssm_state_indices,
+            accepted,
             starts,
-            active,
-            output,
+            lengths,
+            packed_starts,
+            packed_query,
+            packed_key,
+            packed_value,
+            packed_g,
+            packed_beta,
+            packed_indices,
             state.stride(0),
             ssm_state_indices.stride(0),
             ssm_state_indices.stride(1),
-            NUM_STATES=state.shape[0],
+            Q_STRIDES=query.stride(),
+            K_STRIDES=key.stride(),
+            V_STRIDES=value.stride(),
+            G_STRIDES=g.stride(),
+            B_STRIDES=beta.stride(),
+            WIDTH=width,
+            Q_SIZE=q_size,
+            V_SIZE=v_size,
+            K_DIM=key_dim,
+            V_DIM=value_dim,
+            VALUE_HEADS=value_heads,
+            STATE_SIZE=v_size * key_dim,
+            NUM_TILES=tiles,
+            BLOCK=SPEC_TOKEN_BLOCK_SIZE,
+        )
+        packed_output = recurrent_gated_delta_rule(
+            packed_query,
+            packed_key,
+            packed_value,
+            state,
+            g=packed_g,
+            beta=packed_beta,
+            scale=scale,
+            actual_seq_lengths=lengths,
+            ssm_state_indices=packed_indices,
+            num_accepted_tokens=packed_accepted,
+        )
+        output = torch.empty(value.shape, dtype=value.dtype, device=value.device)
+        unpack_spec_output_kernel[(triton.cdiv(v_size, SPEC_TOKEN_BLOCK_SIZE), num_reqs * width)](
+            packed_output,
+            output,
+            starts,
+            lengths,
+            packed_starts,
+            NUM_REQS=num_reqs,
             TOKENS=tokens,
             WIDTH=width,
-            ROW_SIZE=row_size,
-            OUTPUT_ROW_SIZE=value_heads * value_dim,
-            BLOCK=SPEC_STATE_IO_BLOCK_SIZE,
+            V_SIZE=v_size,
+            BLOCK=SPEC_TOKEN_BLOCK_SIZE,
         )
         return output
     output = torch.zeros(value.shape, dtype=value.dtype, device=value.device)

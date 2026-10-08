@@ -8,6 +8,11 @@ import torch_npu  # noqa: F401
 
 from vllm_ascend.ops.triton.fla import recurrent_gdn
 from vllm_ascend.ops.triton.fla.recurrent_gdn import recurrent_gated_delta_rule_spec
+from vllm_ascend.ops.triton.fla.spec_state_io import (
+    SPEC_STATE_IO_BLOCK_SIZE,
+    prepare_spec_states_kernel,
+    scatter_spec_states_kernel,
+)
 
 
 def reference_recurrent(query, key, value, state, g, beta, scale, starts, indices, accepted):
@@ -37,17 +42,20 @@ def reference_recurrent(query, key, value, state, g, beta, scale, starts, indice
     return output
 
 
-@pytest.mark.parametrize("lengths", [(8, 8, 0), (2, 8, 0), (2, 2, 4)])
+@pytest.mark.parametrize("lengths", [(8, 8, 0), (2, 8, 0), (2, 2, 4), (0, 0, 0)])
 @pytest.mark.parametrize("padding", [0, 256])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("graph_mode", [False, True])
 @pytest.mark.parametrize("token_padding", [0, 3])
+@pytest.mark.parametrize("input_stride", [1, 2])
 @torch.inference_mode()
-def test_spec_recurrence_preserves_rows_and_padding(lengths, padding, dtype, graph_mode, token_padding):
+def test_spec_recurrence_preserves_rows_and_padding(lengths, padding, dtype, graph_mode, token_padding, input_stride):
     torch.manual_seed(20261008)
     device = "npu"
     heads, value_heads, key_dim, value_dim = 2, 4, 128, 128
     tokens = sum(lengths) + token_padding
+    if tokens == 0:
+        pytest.skip("The zero-token early return is covered by the unit test.")
     payload = value_heads * value_dim * key_dim
     # A prefix/suffix guard, nonzero storage offset and unselected rows detect
     # writes outside the selected state pages, including shared-page padding.
@@ -72,11 +80,11 @@ def test_spec_recurrence_preserves_rows_and_padding(lengths, padding, dtype, gra
     indices.copy_(table_cpu)
     starts = torch.tensor([0, *torch.tensor(lengths).cumsum(0).tolist()], dtype=torch.int32, device=device)
     accepted = torch.tensor([8, 5, 1], dtype=torch.int32, device=device)
-    query = torch.empty(tokens, heads, key_dim, dtype=dtype, device=device)
+    query = torch.empty(tokens, heads, key_dim * input_stride, dtype=dtype, device=device)[..., ::input_stride]
     key = torch.empty_like(query)
-    value = torch.empty(tokens, value_heads, value_dim, dtype=dtype, device=device)
-    g = torch.empty(tokens, value_heads, dtype=torch.float32, device=device)
-    beta = torch.empty(tokens, value_heads, dtype=dtype, device=device)
+    value = torch.empty(tokens, value_heads, value_dim * input_stride, dtype=dtype, device=device)[..., ::input_stride]
+    g = torch.empty(tokens, value_heads * input_stride, dtype=torch.float32, device=device)[:, ::input_stride]
+    beta = torch.empty(tokens, value_heads * input_stride, dtype=dtype, device=device)[:, ::input_stride]
 
     def randomize_inputs():
         query.copy_(F.normalize(torch.randn(query.shape), dim=-1).to(dtype))
@@ -143,8 +151,8 @@ def test_spec_recurrence_preserves_rows_and_padding(lengths, padding, dtype, gra
 
 @pytest.mark.parametrize("num_reqs", [1, 4, 16])
 @torch.inference_mode()
-def test_spec_recurrence_graph_latency(num_reqs, monkeypatch, record_property):
-    """Report fused-vs-previous-path latency on the same padded cache.
+def test_spec_recurrence_graph_latency(num_reqs, record_property):
+    """Compare the 11682d1e3 full-width call, staged adapter and direct adapter.
 
     Run with pytest -s to see timings. No hardware-independent speed threshold
     is assumed; this benchmark is also a numerical parity check before timing.
@@ -164,6 +172,78 @@ def test_spec_recurrence_graph_latency(num_reqs, monkeypatch, record_property):
     starts = torch.arange(0, tokens + 1, width, dtype=torch.int32, device="npu")
     indices = torch.arange(1, tokens + 1, dtype=torch.int32, device="npu").view(num_reqs, width)
     accepted = torch.full((num_reqs,), width, dtype=torch.int32, device="npu")
+    baseline_state = state.clone().contiguous()
+    baseline_initial = baseline_state.clone()
+    baseline_lengths = torch.tensor([0, *([width] * num_reqs)], dtype=torch.int32, device="npu")
+
+    def baseline():
+        # The old flattened ABI is valid for this full-width, unpadded batch.
+        return recurrent_gdn.recurrent_gated_delta_rule(
+            query,
+            key,
+            value,
+            baseline_state,
+            g=g,
+            beta=beta,
+            scale=dim**-0.5,
+            actual_seq_lengths=baseline_lengths,
+            ssm_state_indices=indices.flatten(),
+            num_accepted_tokens=accepted,
+        )
+
+    def staged():
+        # Reproduce the 984ccc8 adapter for an apples-to-apples state-IO cost.
+        workspace = torch.empty(tokens + 1, value_heads, dim, dim, device="npu")
+        lengths = torch.empty(num_reqs + 1, dtype=torch.int32, device="npu")
+        packed_indices = torch.arange(1, tokens + 1, dtype=torch.int32, device="npu")
+        active = torch.zeros(tokens, dtype=torch.bool, device="npu")
+        tiles = (payload + SPEC_STATE_IO_BLOCK_SIZE - 1) // SPEC_STATE_IO_BLOCK_SIZE
+        prepare_spec_states_kernel[(tiles, num_reqs)](
+            state,
+            workspace,
+            indices,
+            accepted,
+            starts,
+            lengths,
+            active,
+            state.stride(0),
+            indices.stride(0),
+            indices.stride(1),
+            NUM_STATES=state.shape[0],
+            WIDTH=width,
+            ROW_SIZE=payload,
+            BLOCK=SPEC_STATE_IO_BLOCK_SIZE,
+        )
+        result = recurrent_gdn.recurrent_gated_delta_rule(
+            query,
+            key,
+            value,
+            workspace,
+            g=g,
+            beta=beta,
+            scale=dim**-0.5,
+            actual_seq_lengths=lengths,
+            ssm_state_indices=packed_indices,
+            num_accepted_tokens=None,
+        )
+        scatter_spec_states_kernel[(tiles, num_reqs * width)](
+            workspace,
+            state,
+            indices,
+            starts,
+            active,
+            result,
+            state.stride(0),
+            indices.stride(0),
+            indices.stride(1),
+            NUM_STATES=state.shape[0],
+            TOKENS=tokens,
+            WIDTH=width,
+            ROW_SIZE=payload,
+            OUTPUT_ROW_SIZE=value_heads * dim,
+            BLOCK=SPEC_STATE_IO_BLOCK_SIZE,
+        )
+        return result
 
     def run():
         return recurrent_gated_delta_rule_spec(
@@ -180,15 +260,16 @@ def test_spec_recurrence_graph_latency(num_reqs, monkeypatch, record_property):
         )
 
     results, timings = [], []
-    for label, limit in (("previous_triton", 0), ("fused_fla", width)):
-        monkeypatch.setattr(recurrent_gdn, "_FLA_MAX_QUERY_LEN", limit)
+    for label, operation in (("baseline_11682", baseline), ("staged_984ccc8", staged), ("direct_strided", run)):
         storage.copy_(initial)
-        output = run()
+        baseline_state.copy_(baseline_initial)
+        output = operation()
         torch.npu.synchronize()
-        results.append((output.cpu(), storage.cpu()))
+        results.append((output.cpu(), (baseline_state if label == "baseline_11682" else state).cpu()))
+        assert torch.equal(storage[:, payload:].cpu(), initial[:, payload:].cpu())
         graph = torch.npu.NPUGraph()
         with torch.npu.graph(graph):
-            run()
+            operation()
         for _ in range(3):
             graph.replay()
         start, end = torch.npu.Event(enable_timing=True), torch.npu.Event(enable_timing=True)
@@ -201,6 +282,8 @@ def test_spec_recurrence_graph_latency(num_reqs, monkeypatch, record_property):
         record_property(f"{label}_ms", elapsed_ms)
         timings.append(elapsed_ms)
         del graph
-    torch.testing.assert_close(results[0][0], results[1][0], rtol=2e-2, atol=2e-3)
-    torch.testing.assert_close(results[0][1], results[1][1], rtol=2e-4, atol=2e-4)
-    print(f"requests={num_reqs}: previous={timings[0]:.3f} ms, fused={timings[1]:.3f} ms")
+    for result in results[1:]:
+        torch.testing.assert_close(results[0][0], result[0], rtol=2e-2, atol=2e-3)
+        torch.testing.assert_close(results[0][1], result[1], rtol=2e-4, atol=2e-4)
+    record_property("direct_to_baseline_ratio", timings[2] / timings[0])
+    print(f"requests={num_reqs}: baseline={timings[0]:.3f} ms, staged={timings[1]:.3f} ms, direct={timings[2]:.3f} ms")
