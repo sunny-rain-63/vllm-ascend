@@ -24,6 +24,7 @@ import torch
 from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
 from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
+from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker import mamba_utils
 from vllm.v1.worker.gpu.model_states.mamba_hybrid import (
@@ -65,7 +66,7 @@ class _LayerwiseMambaCopyState:
 class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
     """Mamba state with Ascend-specific attention metadata construction.
 
-    Mamba request lifecycle and cache-state handling are inherited from
+    Mamba request lifecycle and cache-state handling extend
     :class:`MambaHybridModelState`. ``AscendModelState`` remains the second
     base so cooperative ``super()`` calls retain the Ascend model-state MRO.
 
@@ -80,6 +81,16 @@ class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
         super().__init__(*args, **kwargs)
         self._layerwise_mamba_copy: _LayerwiseMambaCopyState | None = None
         self._layer_state_ranges: dict[str, tuple[int, int]] | None = None
+
+    def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
+        super().add_request(req_index, new_req_data)
+        if self._align_mode:
+            # Backport vLLM #55601 for the pinned upstream version. A smaller
+            # drafter block can change block_size, but state columns use Mamba units.
+            mamba_block_size = self.cache_config.mamba_block_size
+            assert mamba_block_size is not None
+            if mamba_block_size != self.cache_config.block_size:
+                self._mamba_state_idx_gpu[req_index].fill_((new_req_data.num_computed_tokens - 1) // mamba_block_size)
 
     def _get_layer_state_ranges(self, kv_cache_config: KVCacheConfig) -> dict[str, tuple[int, int]]:
         """Map every mamba layer name to its (start, end) range in the

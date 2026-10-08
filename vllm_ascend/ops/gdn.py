@@ -47,6 +47,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence im
 from vllm_ascend.ops.gdn_attn_builder import AscendGDNFusedAttentionBackend
 from vllm_ascend.ops.triton.fla.chunk import chunk_gated_delta_rule
 from vllm_ascend.ops.triton.fla.fused_qkvzba_split_reshape import fused_qkvzba_split_reshape_cat
+from vllm_ascend.ops.triton.fla.recurrent_gdn import recurrent_gated_delta_rule_spec
 from vllm_ascend.ops.triton.fla.utils import clear_ssm_states
 from vllm_ascend.ops.triton.mamba.causal_conv1d import extract_last_width
 from vllm_ascend.ops.triton.mamba.state_index import gather_ssm_states, scatter_ssm_states_
@@ -558,10 +559,12 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         # 2.1: Process the multi-query part
         if spec_sequence_masks is not None:
-            actual_seq_lengths = attn_metadata.spec_decode_metadata.actual_seq_lengths
             query_spec = l2norm_fwd(query_spec)
             key_spec = l2norm_fwd(key_spec)
-            core_attn_out_spec = recurrent_gated_delta_rule(
+            # FLA's packed-token state indices cannot represent this fixed-
+            # width table when requests verify different numbers of tokens.
+            # Previous acceptance also need not fit the current query length.
+            core_attn_out_spec = recurrent_gated_delta_rule_spec(
                 query_spec.squeeze(0),
                 key_spec.squeeze(0),
                 value_spec.squeeze(0),
@@ -569,8 +572,8 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 g=g_spec.squeeze(0),
                 beta=beta_spec.squeeze(0),
                 scale=key_spec.shape[-1] ** -0.5,
-                actual_seq_lengths=actual_seq_lengths,
-                ssm_state_indices=spec_state_indices_tensor.flatten(),
+                query_start_loc=spec_query_start_loc_device,
+                ssm_state_indices=spec_state_indices_tensor,
                 num_accepted_tokens=spec_causal_conv1d_meta.num_accepted_tokens.to(torch.int32),
             ).unsqueeze(0)
         else:

@@ -55,6 +55,7 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
     IS_CONTINUOUS_BATCHING: tl.constexpr,
     IS_SPEC_DECODING: tl.constexpr,
     IS_KDA: tl.constexpr,
+    SPEC_STATE_WIDTH: tl.constexpr = 0,
 ):
     i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_n, i_hv = i_nh // HV, i_nh % HV
@@ -100,9 +101,14 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
         if IS_CONTINUOUS_BATCHING:
             if IS_SPEC_DECODING:
                 i_t = tl.load(num_accepted_tokens + i_n).to(tl.int64) - 1
+                if SPEC_STATE_WIDTH > 0:
+                    # Acceptance refers to the PREVIOUS verification step,
+                    # so its upper bound is the state-table width, not T.
+                    if i_t < 0 or i_t >= SPEC_STATE_WIDTH:
+                        return
             else:
                 i_t = 0
-            state_idx = tl.load(ssm_state_indices + i_n * stride_indices_seq + i_t).to(tl.int64)
+            state_idx = tl.load(ssm_state_indices + i_n * stride_indices_seq + i_t * stride_indices_tok).to(tl.int64)
             if state_idx <= 0:
                 return
             p_h0 = h0 + state_idx * stride_init_state_token
@@ -137,7 +143,9 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
         tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
 
         if INPLACE_FINAL_STATE:
-            final_state_idx = tl.load(ssm_state_indices + i_n * stride_indices_seq + i_t).to(tl.int64)
+            final_state_idx = tl.load(ssm_state_indices + i_n * stride_indices_seq + i_t * stride_indices_tok).to(
+                tl.int64
+            )
             if final_state_idx > 0:
                 p_ht = ht + final_state_idx * stride_final_state_token
                 p_ht = p_ht + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
