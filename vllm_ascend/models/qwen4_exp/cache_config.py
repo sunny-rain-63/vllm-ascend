@@ -28,6 +28,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheTensor,
     MambaSpec,
     MLAAttentionSpec,
+    SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
 
@@ -41,6 +42,8 @@ QSA_COMPRESSED: Final = "qsa_compressed"
 GDN: Final = "gdn"
 PLE: Final = "ple"
 HIDDEN: Final = "hidden"
+ATTENTION: Final = "attention"
+INDEPENDENT_CACHE_ROLES: Final = (HIDDEN, PLE, ATTENTION)
 
 
 @dataclass(frozen=True)
@@ -93,7 +96,11 @@ class Qwen4KVCacheLayout:
         return next(owner for owner in self.owners if owner.layer_name == layer_name)
 
     def slot_shared_by(self, slot: int) -> list[str]:
-        return [owner.layer_name for owner in self.owners if owner.role not in (HIDDEN, PLE) and owner.slot == slot]
+        return [
+            owner.layer_name
+            for owner in self.owners
+            if owner.role not in INDEPENDENT_CACHE_ROLES and owner.slot == slot
+        ]
 
     def region_name_for_owner(self, layer_name: str) -> str:
         return {
@@ -110,7 +117,7 @@ def _group_member_specs(group: KVCacheGroupSpec) -> dict[str, KVCacheSpec]:
     return {name: group.kv_cache_spec for name in group.layer_names}
 
 
-def _classify_spec(layer_name: str, spec: KVCacheSpec) -> str | None:
+def _classify_spec(layer_name: str, spec: KVCacheSpec, qsa_sources: set[str]) -> str | None:
     if isinstance(spec, HiddenStateCacheSpec):
         return HIDDEN
     if layer_name.endswith(".raw_key_cache") and isinstance(spec, CircularBufferSpec):
@@ -121,8 +128,11 @@ def _classify_spec(layer_name: str, spec: KVCacheSpec) -> str | None:
         and get_kv_cache_compression_ratio(spec) > 1
     ):
         return QSA_COMPRESSED
-    if layer_name.endswith(".attn") and isinstance(spec, FullAttentionSpec):
+    if layer_name.endswith(".attn") and layer_name[: -len(".attn")] in qsa_sources and type(spec) is FullAttentionSpec:
         return QSA_MAIN
+    # DFlash draft attention has no QSA side caches and owns independent pages.
+    if type(spec) is FullAttentionSpec or isinstance(spec, SlidingWindowSpec):
+        return ATTENTION
     if isinstance(spec, MambaSpec):
         if len(spec.shapes) == 2:
             return GDN
@@ -186,6 +196,13 @@ def build_qwen4_kv_cache_layout(
         GDN: [],
         PLE: [],
         HIDDEN: [],
+        ATTENTION: [],
+    }
+    qsa_source_names = {
+        name[: -len(".indexer.raw_key_cache")]
+        for group in kv_cache_groups
+        for name, spec in _group_member_specs(group).items()
+        if name.endswith(".indexer.raw_key_cache") and isinstance(spec, CircularBufferSpec)
     }
     owner_group_ids: dict[str, int] = {}
     unknown: list[tuple[str, KVCacheSpec]] = []
@@ -194,7 +211,7 @@ def build_qwen4_kv_cache_layout(
         for layer_name in group.layer_names:
             owner_group_ids[layer_name] = group_id
             spec = member_specs[layer_name]
-            role = _classify_spec(layer_name, spec)
+            role = _classify_spec(layer_name, spec, qsa_source_names)
             if role is None:
                 unknown.append((layer_name, spec))
             else:
@@ -223,7 +240,7 @@ def build_qwen4_kv_cache_layout(
     qsa_sources = sorted(source_sets[QSA_MAIN], key=_layer_sort_key)
     for role in (QSA_MAIN, QSA_RAW, QSA_COMPRESSED):
         role_members[role] = [qsa_by_role[role][source] for source in qsa_sources]
-    for role in (GDN, PLE, HIDDEN):
+    for role in (GDN, PLE, HIDDEN, ATTENTION):
         role_members[role].sort(key=lambda item: _owner_sort_key(item[0]))
 
     dtype_sizes = {
@@ -309,10 +326,11 @@ def build_qwen4_kv_cache_layout(
                 raise ValueError(f"Cache group {group_id} exceeds the {slot_count} QSA slots")
             owners.append(CacheOwner(layer_name, spec, role, slot, group_id))
             group_slots[group_id] = slot + 1
-    owners.extend(
-        CacheOwner(layer_name, spec, HIDDEN, slot, owner_group_ids[layer_name])
-        for slot, (layer_name, spec) in enumerate(role_members[HIDDEN])
-    )
+    for role in (HIDDEN, ATTENTION):
+        owners.extend(
+            CacheOwner(layer_name, spec, role, slot, owner_group_ids[layer_name])
+            for slot, (layer_name, spec) in enumerate(role_members[role])
+        )
     layout = Qwen4KVCacheLayout(
         regions=tuple(regions),
         owners=tuple(owners),
@@ -330,7 +348,7 @@ def build_qwen4_kv_cache_layout(
         assert region.offset % alignment == 0
         assert region.end <= slot_backing_size
     for owner in layout.owners:
-        if owner.role in (HIDDEN, PLE):
+        if owner.role in INDEPENDENT_CACHE_ROLES:
             continue
         region = layout.region(layout.region_name_for_owner(owner.layer_name))
         dtypes = owner.spec.dtypes if isinstance(owner.spec, MambaSpec) else (owner.spec.dtype,)
@@ -600,7 +618,7 @@ def get_qwen4_exp_pool_bytes_per_block(
     layout = build_qwen4_kv_cache_layout(kv_cache_groups, num_blocks=1)
     if layout is None:
         return None
-    private_bytes = sum(_private_page_bytes(owner) for owner in layout.owners if owner.role in (HIDDEN, PLE))
+    private_bytes = sum(_private_page_bytes(owner) for owner in layout.owners if owner.role in INDEPENDENT_CACHE_ROLES)
     return layout.slot_count * layout.slot_backing_size + private_bytes
 
 
@@ -628,7 +646,24 @@ def get_qwen4_exp_kv_cache_groups(
     owners = _prepare_qsa_composite_groups(kv_cache_spec)
     if owners is None:
         return None
-    groups = get_default_groups(vllm_config, kv_cache_spec)
+    # Keep ordinary DFlash attention in separate groups so it cannot acquire
+    # the QSA main/compressed lifetime or its packed shared-cache layout.
+    ordinary_attention_specs = {
+        name: spec
+        for name, spec in kv_cache_spec.items()
+        if name not in owners[0] and (type(spec) is FullAttentionSpec or isinstance(spec, SlidingWindowSpec))
+    }
+    groups = get_default_groups(
+        vllm_config,
+        {name: spec for name, spec in kv_cache_spec.items() if name not in ordinary_attention_specs},
+    )
+    if ordinary_attention_specs:
+        ordinary_groups = get_default_groups(vllm_config, ordinary_attention_specs)
+        speculative_config = getattr(vllm_config, "speculative_config", None)
+        if getattr(speculative_config, "method", None) == "dflash" and speculative_config.use_eagle_block_drop():
+            for group in ordinary_groups:
+                group.is_eagle_group = True
+        groups.extend(ordinary_groups)
     groups = _merge_qsa_composite_groups(groups, kv_cache_spec, *owners)
     groups = _merge_mamba_state_groups(groups, len(owners[0]))
     logger.info(
@@ -661,7 +696,7 @@ def get_qwen4_exp_kv_cache_config(
     if probe is None:
         return None
 
-    private_owners = [owner for owner in probe.owners if owner.role in (HIDDEN, PLE)]
+    private_owners = [owner for owner in probe.owners if owner.role in INDEPENDENT_CACHE_ROLES]
     private_bytes_per_block = sum(_private_page_bytes(owner) for owner in private_owners)
     slab_bytes_per_block = probe.slot_backing_size
     bytes_per_block = probe.slot_count * slab_bytes_per_block + private_bytes_per_block

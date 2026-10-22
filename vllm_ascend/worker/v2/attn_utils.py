@@ -99,8 +99,9 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_man
 from vllm_ascend.models.deepseek_v41.cache_config import is_deepseek_v41_cache
 from vllm_ascend.models.glm5next.cache_views import view_compressed_indexer_cache, view_kpool_tail_cache
 from vllm_ascend.models.qwen4_exp.cache_config import (
+    ATTENTION,
     GDN,
-    HIDDEN,
+    INDEPENDENT_CACHE_ROLES,
     PLE,
     QSA_COMPRESSED,
     QSA_MAIN,
@@ -1180,9 +1181,8 @@ def _allocate_kv_cache(
             device,
         )
         for cache_owner in qwen4_cache_layout.owners:
-            if cache_owner.role in (PLE, HIDDEN):
-                # PLE indexed updates require dense blocks; r2's larger
-                # stride would materialize the entire state pool.
+            if cache_owner.role in INDEPENDENT_CACHE_ROLES:
+                # PLE, hidden states and DFlash draft attention own dense banks.
                 size = (
                     cache_owner.spec.state_content_size_bytes
                     if isinstance(cache_owner.spec, MambaSpec)
@@ -1710,6 +1710,28 @@ def _reshape_kv_cache_v2(
                 raw_slab = kv_cache_raw_tensors[layer_name]
                 if not isinstance(raw_slab, torch.Tensor):
                     raise ValueError(f"Qwen4 hybrid cache for {layer_name} must use one raw tensor.")
+                if owner.role == ATTENTION:
+                    # Ordinary DFlash attention owns independent padded pages
+                    # and uses kernel-block addressed tables.
+                    assert isinstance(kv_cache_spec, AttentionSpec)
+                    blocks_per_page = kv_cache_spec.block_size // kernel_block_size
+                    page_stride = kv_cache_spec.page_size_bytes // blocks_per_page
+                    shape = (
+                        kv_cache_config.num_blocks * blocks_per_page,
+                        kernel_block_size,
+                        kv_cache_spec.num_kv_heads,
+                        kv_cache_spec.head_size,
+                    )
+                    key = make_page_strided_cache_view(raw_slab, shape, kv_cache_spec.dtype, page_stride)
+                    value = make_page_strided_cache_view(
+                        raw_slab,
+                        (*shape[:-1], kv_cache_spec.head_size_v),
+                        kv_cache_spec.dtype,
+                        page_stride,
+                        offset_bytes=math.prod(shape[1:]) * get_dtype_size(kv_cache_spec.dtype),
+                    )
+                    kv_caches[layer_name] = (key, value)
+                    continue
                 slot_offset = owner.slot * qwen4_cache_layout.slot_backing_size
                 if owner.role == QSA_MAIN:
                     assert isinstance(kv_cache_spec, FullAttentionSpec)
@@ -1803,7 +1825,7 @@ def _reshape_kv_cache_v2(
                         )
                     ]
                     continue
-                if owner.role != HIDDEN:
+                if owner.role not in INDEPENDENT_CACHE_ROLES:
                     raise RuntimeError(f"Unsupported Qwen4 hybrid owner {owner}.")
 
             if layer_name in layer_tuple_strides:
