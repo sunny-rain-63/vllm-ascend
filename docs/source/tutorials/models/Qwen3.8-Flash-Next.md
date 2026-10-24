@@ -359,6 +359,13 @@ Please refer to the [Public Performance Tuning Documentation](../../developer_gu
 
 Please refer to the [Feature Matrix](../../user_guide/support_matrix/feature_matrix.md) for detailed feature descriptions.
 
+### 9.3 Investigating MTP Graph Acceptance
+
+For a sustained acceptance gap between eager drafting and graph drafting, use
+the [Qwen4Exp MTP replay investigation](../../developer_guide/performance_and_debug/qwen4_exp_mtp_replay.md)
+to check padded QSA cache writes and isolate draft step 0 from later draft steps.
+Validate replay correctness before using the original workload to measure TPOT.
+
 ## 10 FAQ
 
 For common environment, installation, and parameter issues, refer to the [Public FAQs](../../faqs.md).

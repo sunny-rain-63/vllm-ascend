@@ -1,0 +1,23 @@
+{
+  "trust_remote_code": true,
+  "quantization": "ascend",
+  "tensor_parallel_size": 8,
+  "data_parallel_size": 1,
+  "enable_expert_parallel": true,
+  "max_model_len": 141312,
+  "max_num_seqs": 32,
+  "max_num_batched_tokens": 4096,
+  "gpu_memory_utilization": 0.9,
+  "enable_prefix_caching": false,
+  "async_scheduling": true,
+  "compilation_config": {
+    "cudagraph_capture_sizes": [4, 8, 12, 16, 20, 24, 28, 32],
+    "cudagraph_mode": "FULL_DECODE_ONLY"
+  },
+  "additional_config": {
+    "enable_cpu_binding": true,
+    "ascend_compilation_config": {
+      "fuse_norm_quant": false
+    }
+  }
+}

@@ -47,6 +47,7 @@ from vllm_ascend.ops.triton.qwen4_exp.qsa import (
 )
 
 from .lightning_indexer import qsa_select_paged_tokens_lightning
+from .qsa_metadata import build_qsa_metadata
 
 QSAKVCache: TypeAlias = torch.Tensor | tuple[torch.Tensor, torch.Tensor]
 
@@ -516,8 +517,9 @@ qsa_cache.QSAStateBackend.uses_descriptor_cache_view = True
 
 
 # qsa_cache selects its Triton metadata builder at import time. The upstream
-# kernel uses CUDA PDL intrinsics, so Ascend must use the equivalent Torch path.
-qsa_cache.build_qsa_metadata = qsa_cache._build_qsa_metadata_torch
+# kernel uses CUDA PDL intrinsics, so keep the Torch path and sanitize its
+# persistent padding buffers with the Ascend replay-safe metadata helper.
+qsa_cache.build_qsa_metadata = build_qsa_metadata
 
 
 class AscendQwen4ExpQSAAttention(upstream_qsa.Qwen4ExpQSAAttention):

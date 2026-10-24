@@ -1,0 +1,4 @@
+pr: 17249
+entries:
+  - category: bugfix
+    text: Prevented padded Qwen4Exp QSA rows from writing stale raw-cache slots during MTP graph replay, including graph bucket transitions and shrinking batches.
