@@ -13,10 +13,12 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     MambaSpec,
     MLAAttentionSpec,
+    SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
 
 from vllm_ascend.models.qwen4_exp.cache_config import (
+    ATTENTION,
     GDN,
     HIDDEN,
     PLE,
@@ -107,6 +109,29 @@ def _groups() -> list[KVCacheGroupSpec]:
         KVCacheGroupSpec(["model.ple"], ple),
         KVCacheGroupSpec(["model.cache_only_layers.0"], hidden),
     ]
+
+
+def _groups_with_dflash(padding: int = 0) -> list[KVCacheGroupSpec]:
+    groups = _groups()
+    specs = (
+        FullAttentionSpec(block_size=64, num_kv_heads=2, head_size=32, dtype=torch.bfloat16),
+        SlidingWindowSpec(
+            block_size=64,
+            num_kv_heads=2,
+            head_size=32,
+            dtype=torch.bfloat16,
+            sliding_window=128,
+        ),
+    )
+    for layer_idx, spec in enumerate(specs):
+        groups.append(
+            KVCacheGroupSpec(
+                [f"draft.model.layers.{layer_idx}.self_attn.attn"],
+                replace(spec, page_size_padded=spec.page_size_bytes + padding) if padding else spec,
+                is_eagle_group=True,
+            )
+        )
+    return groups
 
 
 def _ungrouped_qwen_specs() -> dict[str, KVCacheSpec]:
@@ -979,3 +1004,120 @@ def test_whole_page_sharing_uses_one_tp4_page_for_qsa_or_complete_gdn():
     gdn_ssm[1].zero_()
     assert torch.count_nonzero(qsa[1].flatten()[: 798 * 1024 // 2]) == 0
     assert torch.count_nonzero(qsa[[0, 2]]) == 0
+
+
+@pytest.mark.parametrize("padding", [0, 512])
+def test_dflash_attention_uses_independent_pages_and_budget(padding: int) -> None:
+    baseline = build_qwen4_kv_cache_layout(_groups(), num_blocks=3)
+    groups = _groups_with_dflash(padding)
+    layout = build_qwen4_kv_cache_layout(groups, num_blocks=3)
+    assert baseline is not None and layout is not None
+    assert layout.regions == baseline.regions
+    assert layout.slot_count == baseline.slot_count
+    assert layout.slot_backing_size == baseline.slot_backing_size
+    assert layout.owner("model.mtp.layers.48.self_attn.attn").role == "qsa_main"
+    for layer_idx in range(2):
+        name = f"draft.model.layers.{layer_idx}.self_attn.attn"
+        assert layout.owner(name).role == ATTENTION
+        assert name not in layout.slot_shared_by(layer_idx)
+
+    bytes_per_block = get_qwen4_exp_pool_bytes_per_block(groups)
+    config = get_qwen4_exp_kv_cache_config(
+        SimpleNamespace(cache_config=SimpleNamespace(num_gpu_blocks_override=3, prefix_cache_retention_interval=None)),
+        groups,
+        bytes_per_block * 3,
+    )
+    assert config is not None
+    descriptors = {descriptor.layers[0]: descriptor for descriptor in config.kv_cache_tensors}
+    for layer_idx in range(2):
+        name = f"draft.model.layers.{layer_idx}.self_attn.attn"
+        owner = layout.owner(name)
+        descriptor = descriptors[name]
+        assert descriptor.size == owner.spec.page_size_bytes * config.num_blocks
+        assert descriptor.block_stride == owner.spec.page_size_bytes
+        assert descriptor.offset == 0
+
+    admission_config = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=768),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+        cache_config=SimpleNamespace(
+            mamba_cache_mode="align",
+            num_gpu_blocks_override=None,
+            prefix_cache_retention_interval=None,
+        ),
+        max_in_flight_tokens=16,
+    )
+    required_blocks = sum(
+        (group.kv_cache_spec.max_memory_usage_bytes(admission_config) + group.kv_cache_spec.page_size_bytes - 1)
+        // group.kv_cache_spec.page_size_bytes
+        for group in groups
+    )
+    assert _ascend_max_memory_usage_bytes_from_groups(admission_config, groups) == bytes_per_block * required_blocks
+
+
+@pytest.mark.parametrize("block_drop", [False, True])
+def test_dflash_grouping_separates_ordinary_draft_attention(block_drop: bool) -> None:
+    specs = {
+        name: spec
+        for group in _groups_with_dflash()
+        for name, spec in (
+            group.kv_cache_spec.kv_cache_specs.items()
+            if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+            else ((name, group.kv_cache_spec) for name in group.layer_names)
+        )
+    }
+    calls = []
+
+    def default_groups(config, members):
+        calls.append((config, members))
+        return [KVCacheGroupSpec([name], spec) for name, spec in members.items()]
+
+    config = SimpleNamespace(
+        speculative_config=SimpleNamespace(method="dflash", use_eagle_block_drop=lambda: block_drop)
+    )
+    groups = get_qwen4_exp_kv_cache_groups(config, specs, default_groups)
+    assert groups is not None
+    draft_groups = [group for group in groups if any(name.startswith("draft.") for name in group.layer_names)]
+    assert len(draft_groups) == 2
+    assert all(group.is_eagle_group == block_drop for group in draft_groups)
+    assert all(not group.is_eagle_group for group in groups if group not in draft_groups)
+    assert len(calls) == 2
+    assert all(name.startswith("draft.") for name in calls[1][1])
+
+
+@pytest.mark.parametrize("padding", [0, 512])
+def test_dflash_cache_writes_preserve_target_and_other_requests(monkeypatch, padding: int) -> None:
+    groups = _groups_with_dflash(padding)
+    config = get_qwen4_exp_kv_cache_config(
+        SimpleNamespace(cache_config=SimpleNamespace(num_gpu_blocks_override=3, prefix_cache_retention_interval=None)),
+        groups,
+        10**9,
+    )
+    assert config is not None
+    raw, caches, _ = _allocate_mrv2_kv_cache(
+        config,
+        monkeypatch,
+        kernel_block_sizes=[16] * len(groups),
+    )
+
+    qsa_name = "model.layers.11.self_attn.attn"
+    draft_names = [f"draft.model.layers.{layer_idx}.self_attn.attn" for layer_idx in range(2)]
+    assert raw[draft_names[0]].data_ptr() != raw[qsa_name].data_ptr()
+    assert raw[draft_names[1]].data_ptr() != raw[draft_names[0]].data_ptr()
+    for name in draft_names:
+        assert torch.count_nonzero(raw[name]).item() == 0
+        key, value = caches[name]
+        assert key.shape == value.shape == (12, 16, 2, 32)
+        # Physical scheduler page 1 contains four kernel blocks. Context and
+        # query writes must leave another request's pages and the target intact.
+        key[4, 0].fill_(3)
+        value[7, 15].fill_(5)
+        assert torch.all(key[4, 0] == 3)
+        assert torch.all(value[4, 0] == 0)
+        assert torch.all(value[7, 15] == 5)
+        assert torch.all(key[7, 15] == 0)
+        assert torch.count_nonzero(key[:4]).item() == 0
+        assert torch.count_nonzero(value[:4]).item() == 0
+        assert torch.count_nonzero(key[8:]).item() == 0
+        assert torch.count_nonzero(value[8:]).item() == 0
+        assert torch.count_nonzero(raw[qsa_name]).item() == 0
