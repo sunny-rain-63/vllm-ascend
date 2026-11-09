@@ -395,7 +395,46 @@ class AscendDSparkSpeculator(LmheadTPDraftSamplingMixin, DSparkSpeculator):
                 continue
             decode_metadata = metadata.decode if self.attn_architecture == "MLA" else metadata
             decode_metadata.actual_seq_lengths_q = query_lens_list
+            # The dense builder pads seq_lens/seq_lens_list/block_tables with a
+            # synthetic FIA TND-tail request when the real batch is smaller than
+            # the padded FULL-graph batch (the draft path reports is_prefilling
+            # as all-False, so the tail is always appended). The rebuild above
+            # drops the tail, so realign the padded fields to the padded request
+            # count or the updatable graph rejects the FIA update with error
+            # 561002 (actual_seq_lengths_kv length vs captured batchSize).
+            self._realign_fia_padding_fields(decode_metadata, num_reqs_padded)
         return attn_metadata
+
+    @staticmethod
+    def _realign_fia_padding_fields(metadata, num_reqs_padded):
+        """Trim or extend batch-indexed fields to the padded request count."""
+        seq_lens_list = getattr(metadata, "seq_lens_list", None)
+        if seq_lens_list is None:
+            return
+        num_entries = len(seq_lens_list)
+        if num_entries > num_reqs_padded:
+            metadata.seq_lens_list = seq_lens_list[:num_reqs_padded]
+        elif num_entries < num_reqs_padded:
+            metadata.seq_lens_list = seq_lens_list + [1] * (num_reqs_padded - num_entries)
+        else:
+            return
+        for field in ("seq_lens", "seq_lens_cpu"):
+            tensor = getattr(metadata, field, None)
+            shape = getattr(tensor, "shape", None)
+            if shape is None or shape[0] == num_reqs_padded:
+                continue
+            if shape[0] > num_reqs_padded:
+                setattr(metadata, field, tensor[:num_reqs_padded])
+            else:
+                setattr(metadata, field, torch.cat([tensor, tensor.new_ones(num_reqs_padded - shape[0])]))
+        block_tables = getattr(metadata, "block_tables", None)
+        shape = getattr(block_tables, "shape", None)
+        if shape is not None:
+            if shape[0] > num_reqs_padded:
+                metadata.block_tables = block_tables[:num_reqs_padded]
+            elif shape[0] < num_reqs_padded:
+                pad_rows = block_tables.new_zeros((num_reqs_padded - shape[0],) + tuple(shape[1:]))
+                metadata.block_tables = torch.cat([block_tables, pad_rows], dim=0)
 
     def propose(
         self,
